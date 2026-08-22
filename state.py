@@ -2,7 +2,7 @@ from typing import TypedDict
 
 
 class ArticleState(TypedDict):
-    """在三个 Agent 之间共享的状态。
+    """在多个 Agent 之间共享的状态。
 
     draft 由写作节点写入；审校节点会读 draft 并写入
     quality_score / passed / revision_feedback / final_article，
@@ -10,7 +10,7 @@ class ArticleState(TypedDict):
     """
 
     topic: str               # 用户输入的题目
-    outline: str             # 调研 Agent 产出的提纲与素材
+    outline: str             # 大纲子智能体产出的可用提纲
     draft: str               # 写作 Agent 产出的草稿
     final_article: str       # 审校 Agent 润色后的文章（合格时为成品）
     quality_score: int       # 审校 Agent 给出的质量分（0-100）
