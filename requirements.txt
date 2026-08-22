@@ -1,2 +1,5 @@
+# langgraph, openai
 langgraph
 openai
+# 联网搜索（调研 Agent 用），无需 API Key
+ddgs

@@ -38,3 +38,25 @@ def call_llm(
         **kwargs,
     )
     return response.choices[0].message.content
+
+
+def chat(
+    system: str,
+    messages: list,
+    tools: list | None = None,
+    max_tokens: int = 16000,
+):
+    """需要工具调用或多轮消息时使用的底层调用，返回完整响应对象。
+
+    call_llm 是一次性问答的封装；这里保留原始响应，以便读取
+    response.choices[0].message.tool_calls 来实现 ReAct 循环。
+    """
+    kwargs = {}
+    if tools:
+        kwargs["tools"] = tools
+    return client.chat.completions.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "system", "content": system}, *messages],
+        **kwargs,
+    )
