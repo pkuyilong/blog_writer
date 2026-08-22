@@ -2,6 +2,24 @@
 from ddgs import DDGS
 
 MAX_RESULTS = 5
+REGION = "cn-zh"  # 中文区域，能让维基百科等中文权威源更靠前
+
+
+def _clean_title(title: str) -> str:
+    """清洗 DDGS 返回的标题。
+
+    DuckDuckGo 在结果不足时会**把多个站点的标题拼接成一串**（如
+    "A_B百度百科B - WikiwandC一篇就够了。 - 知乎D架构_百度百科…"）。
+    这类脏字符串没有意义，截断到第一个明显的拼接点，避免污染模型输入。
+    """
+    if not title:
+        return ""
+    # 截断到第一个标题分隔符（· 是常见的标题连接符，多出现一次即视为拼接）
+    parts = title.split("·")
+    if len(parts) > 1:
+        # 保留第一段 + 还原一个分隔符，丢弃后续拼接内容
+        title = parts[0] + "…"
+    return title.strip()
 
 
 def web_search(query: str) -> str:
@@ -11,7 +29,7 @@ def web_search(query: str) -> str:
     """
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=MAX_RESULTS))
+            results = list(ddgs.text(query, region=REGION, max_results=MAX_RESULTS))
     except Exception as e:
         return f"搜索暂时不可用（{e}）。请基于自身知识作答。"
 
@@ -20,11 +38,13 @@ def web_search(query: str) -> str:
 
     lines = []
     for i, r in enumerate(results[:MAX_RESULTS], 1):
-        title = r.get("title", "")
+        title = _clean_title(r.get("title", ""))
+        if not title:
+            continue  # 清洗后为空则跳过该条
         href = r.get("href", "")
-        body = (r.get("body", "") or "")[:150]  # 截断摘要，避免工具结果超长
+        body = (r.get("body", "") or "")[:500]  # 截断摘要，避免工具结果超长
         lines.append(f"{i}. {title}\n   链接：{href}\n   摘要：{body}")
-    return "\n\n".join(lines)
+    return "\n\n".join(lines) if lines else "搜索没有返回结果，请换个关键词或基于自身知识作答。"
 
 
 # 工具定义（OpenAI 兼容的 function schema），传给 chat.completions 的 tools 参数
