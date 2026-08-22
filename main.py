@@ -28,11 +28,14 @@ def main() -> int:
     print(f"题目：《{args.topic}》\n")
 
     graph = build_graph()
-    result = graph.invoke({"topic": args.topic})
+    result = graph.invoke(
+        {"topic": args.topic, "revision_count": 0, "revision_feedback": ""}
+    )
 
     article = result["final_article"]
     print("\n" + "=" * 50)
-    print("成品文章：")
+    print(f"成品文章（质量分 {result.get('quality_score', 'N/A')}/100，"
+          f"审校 {result.get('revision_count', 'N/A')} 次）：")
     print("=" * 50)
     print(article)
 
