@@ -1,5 +1,8 @@
 # langgraph, openai
 langgraph
 openai
+# LangSmith 可观测性支持
+langgraph-langsmith
+langchain-core
 # 联网搜索（调研 Agent 用），无需 API Key
 ddgs

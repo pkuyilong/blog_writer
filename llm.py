@@ -1,5 +1,6 @@
 import os
 
+from langsmith import traceable
 from openai import OpenAI
 
 # 通过 OpenAI 兼容端点调用 DeepSeek 官方 API。
@@ -13,6 +14,7 @@ client = OpenAI(
 MODEL = "deepseek-v4-flash"
 
 
+@traceable(run_type="llm", name="deepseek_call_llm")
 def call_llm(
     system: str,
     user_content: str,
@@ -40,6 +42,7 @@ def call_llm(
     return response.choices[0].message.content
 
 
+@traceable(run_type="llm", name="deepseek_chat")
 def chat(
     system: str,
     messages: list,

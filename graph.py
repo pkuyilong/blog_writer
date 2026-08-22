@@ -3,6 +3,7 @@ from langgraph.graph import START, END, StateGraph
 from agents.editor import editor_node
 from agents.researcher import researcher_node
 from agents.writer import writer_node
+from langsmith_config import setup_langsmith
 from state import ArticleState
 
 # 最多打回重写几次（超出即接受当前结果，防止死循环）
@@ -19,7 +20,13 @@ def should_continue(state: ArticleState) -> str:
 
 
 def build_graph():
-    """组装流水线：调研 → 写作 → 审校，审校不合格时打回写作重写。"""
+    """组装流水线：调研 → 写作 → 审校，审校不合格时打回写作重写。
+
+    LangGraph 会根据环境变量自动向 LangSmith 上报执行过程（见 langsmith_config.py）。
+    """
+    # 校验 LangSmith 配置并设置项目名（未配置时仅打印提示，不影响运行）
+    setup_langsmith(project_name="b_writer")
+
     graph = StateGraph(ArticleState)
     graph.add_node("research", researcher_node)
     graph.add_node("write", writer_node)
