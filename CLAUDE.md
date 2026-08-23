@@ -24,8 +24,12 @@ python main.py "题目" --verbose --log-file /tmp/bw.log
 # 用虚拟环境
 .venv/bin/python main.py "题目"
 
-# 人工介入：大纲生成后暂停，确认/修改后再继续（默认全自动）
+# 人工介入：大纲生成后 interrupt() 暂停，确认/修改后再继续（默认全自动）
 python main.py "题目" --human-review
+# 断点续跑：中途退出/Ctrl+C 后，从上次暂停点接着写（SqliteSaver 持久化到 .checkpoints/）
+python main.py --resume <thread_id>
+# 用 MemorySaver 代替 SqliteSaver（进程内、退出即失；仅供对比学习跨进程持久化）
+python main.py "题目" --human-review --in-memory
 
 # 确定性控制流测试（mock chat/web_search，不耗 token）
 .venv/bin/python /Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py
@@ -37,7 +41,9 @@ python main.py "题目" --human-review
 主图（graph.py）：START → outline(子图) → [human_review?] → split → fan_out ─Send×N─→ write_section → merge → edit
                                                                     ↑                        │
                                                     rewrite（只重写问题章节）←（should_continue）┘
-  · human_review（可选，--human-review 开关经条件边启用）：大纲后暂停，人工确认/修改大纲后再走 split；默认关闭完全不执行
+  · human_review（可选，--human-review 开关经条件边启用）：大纲后 interrupt() 暂停，把大纲交给 main.py 交互循环；
+    回车确认 / 意见重写 / #粘贴后 Command(resume=...) 续跑；有意见（review_feedback）经 route_review 条件边回环
+    重写再二次确认；默认关闭完全不执行
   · split：LLM 把 outline 文本拆成 [{title, points, materials}]（revision_count>0 时复用，不重复调 LLM）
   · fan_out（split 的条件边）：返回 [Send("write_section", ...)×N]；打回时只 Send failed_sections 里的章节
   · write_section：并行写单章，返回 {"section_drafts": {id: text}}（reducer {**a,**b} 聚合，重写覆盖同 id）
@@ -55,7 +61,7 @@ outline 子图（agents/outliner.py，自包含）：
 
 | 文件 | 职责 |
 |---|---|
-| `main.py` | CLI 入口：解析题目/输出文件，invoke 主图，打印成品 |
+| `main.py` | CLI 入口：解析参数/装配 checkpointer（SqliteSaver 或 --in-memory 的 MemorySaver）/统一交互循环（处理 `__interrupt__` 与 `Command(resume=...)`）/`--resume` 断点续跑/打印成品 |
 | `graph.py` | 主图编排：`outline → split → write_section×N → merge → edit`，`should_continue` 决定打回重写（只重写问题章节） |
 | `state.py` | `ArticleState`（TypedDict）：主图共享状态，**不含 materials**（素材只在子图内部流动）；`section_drafts` 用 `Annotated[dict, reducer]` 聚合并行章节草稿 |
 | `llm.py` | DeepSeek 调用封装：`call_llm()`（一次性问答，可选 JSON 模式）/ `chat()`（返回完整响应以便读 `tool_calls`），均 `@traceable` 上报 LangSmith |
@@ -64,7 +70,7 @@ outline 子图（agents/outliner.py，自包含）：
 | `agents/outliner.py` | **大纲子智能体**：自包含子图（搜索→审查→生成→自检→补搜/重试/兜底）；搜索多查询 ThreadPool 并行 |
 | `agents/writer.py` | `split_sections`（拆章，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `write_section`（并行写单章）/ `merge_sections`（按序拼装） |
 | `agents/editor.py` | 审校节点：`json_mode=True` 输出 JSON（score/passed/revised_article/**failed_sections**[{id,feedback}]） |
-| `agents/human_review.py` | **人工介入节点**：大纲后暂停，回车确认/输入意见重写（REVISE_OUTLINE_PROMPT）/`#` 粘贴新大纲/`q` 退出；`build_graph(enable_human_review=True)` 经条件边启用 |
+| `agents/human_review.py` | **人工介入节点**：`interrupt()` 暂停把大纲交给客户端，按 `Command(resume=...)` 的 action（confirm/revise/replace）决定下一步；revise 时把 `review_feedback` 写进 state、经 `route_review` 条件边回环，节点开头按意见重写（REVISE_OUTLINE_PROMPT）再二次确认；`build_graph(enable_human_review=True)` 经条件边启用 |
 | `langsmith_config.py` | LangSmith 配置：读 `.env`、校验环境变量、设置项目名 |
 | `logging_config.py` | 统一日志：所有模块用 `logging` 替代 print；stderr 简洁输出（保留 emoji 观感）+ 文件（默认 `blog_writer.log`）详细追踪；`--verbose` 控制终端级别；`setup_logging()` 幂等 |
 
@@ -93,7 +99,16 @@ outline 子图（agents/outliner.py，自包含）：
 
 9. **`get_graph()` 静态渲染不展开 Send 条件边**：编译后的图 `get_graph().edges` 只显示静态直连边，Send fan-out 不会出现在边列表里（断言节点链/边时别依赖它）。运行时链路正确性用 `invoke` + mock LLM 验证（见 test_section_writer.py）。
 
-10. **人工介入（可选，`--human-review`）**：`outline` 后加条件边路由到 `human_review` 节点，用**同步 `input()`** 交互——不用 langgraph `interrupt()`（那需要 checkpoint 持久化 + 多轮 resume，对一次性 CLI invoke 过重，且项目无 checkpoint 配置）。开关经 `build_graph(enable_human_review)` 参数 + `functools.partial` 绑定到模块级 `route_outline`（条件边函数），关闭时节点完全不执行、图与全自动版本一致。注意 `route_outline` 引用的开关只能通过 `partial` 注入——它若直接读模块级名字会 `NameError`，若用全局变量则多图并存时互相污染。交互提示走 stderr（`print(..., file=sys.stderr)`），保持 stdout 只给成品文章。打回重写循环（split ← edit）不经过该节点，人工只确认一次。注意 `REVISE_OUTLINE_PROMPT` 不含 "json" 字样（走非 json_mode 的 `call_llm`）。
+10. **人工介入（可选，`--human-review`）——LangGraph 正统 HITL**：`outline` 后条件边路由到 `human_review` 节点，用 **`interrupt()` + `Command(resume=...)`** 协议替代早期版本的节点内同步 `input()`（早期决策笔记见 git 历史）。要点：
+    - **必须配 checkpointer**：`build_graph(enable_human_review, checkpointer)` 把 saver 传进 `graph.compile(checkpointer=...)`，interrupt 才有意义。无 checkpointer 时 interrupt 仍返回 `__interrupt__`（可暂停）但不持久化、不可 resume（实测 1.2.11）。
+    - **resume 后节点从头重执行**：所以"按意见重写"逻辑放在 `human_review_node` 开头（读 `state["review_feedback"]` 非空就调 `_revise_outline`），重写后再次 interrupt 展示确认；确认后清空 `review_feedback`。
+    - **多轮修改**：`review_feedback` 非空时 `route_review` 条件边回环 `human_review`，形成 interrupt → resume(revise) → 回环 → interrupt → resume(confirm) 的循环，完全由 LangGraph 控制（不再阻塞节点）。
+    - **`__interrupt__` 返回格式**：invoke 返回 `{"__interrupt__": [Interrupt(value=..., id=...), ...]}`，payload 取 `result["__interrupt__"][0].value`；resume 用 `Command(resume={...})`。
+    - **断点续跑（`--resume <thread_id>`）**：SqliteSaver 持久化到 `.checkpoints/`（需 `langgraph-checkpoint-sqlite` 包）。**坑**：`SqliteSaver.from_conn_string(DB)` 返回的是 context manager，必须 `with ... as cp:` 解包后再传给 `compile(checkpointer=cp)`，直接传会报 `TypeError: Invalid checkpointer... Received _GeneratorContextManager`（实测踩坑；MemorySaver 直接 new 即可）。进程退出/Ctrl+C 后，`python main.py --resume <thread_id>` 打开同一 checkpoint（`graph.get_state(config)` 看快照），停在中断处时 `invoke(None)` 会重新触发同一 interrupt 进入交互。**resume 时须与上次带相同的 `--human-review`**，保证图结构一致。
+    - **`--in-memory`**：用 MemorySaver（进程内、退出即失）对比 SqliteSaver 的跨进程持久化，纯学习用。
+    - 开关经 `build_graph(enable_human_review)` + `functools.partial` 绑定 `route_outline`（条件边函数）：`route_outline` 若直接读模块级名字会 `NameError`，用全局变量则多图并存互相污染，只能 `partial` 注入。关闭时节点完全不执行、图与全自动版本一致。
+    - 交互提示由 `main.py` 统一走 stderr（`print(..., file=sys.stderr)`），保持 stdout 只给成品文章（`> out.md` 重定向不混入）。
+    - 打回重写循环（split ← edit）不经过该节点；`REVISE_OUTLINE_PROMPT` 不含 "json" 字样（走非 json_mode 的 `call_llm`）。
 
 ## 测试方法
 

@@ -1,5 +1,7 @@
 # langgraph, openai
 langgraph
+# SqliteSaver（checkpoint 跨进程持久化，--resume 断点续跑用）
+langgraph-checkpoint-sqlite
 openai
 # LangSmith 可观测性支持
 langgraph-langsmith

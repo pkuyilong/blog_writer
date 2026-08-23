@@ -1,36 +1,29 @@
-"""人工介入节点：大纲生成后、拆分章节前，让用户确认或修改大纲。
+"""人工介入节点：大纲生成后、拆分章节前，用 LangGraph 的 interrupt() 协议暂停，
+把大纲交给客户端（main.py 的交互循环）确认/修改，再经 Command(resume=...) 续跑。
 
-开关：CLI 加 `--human-review` 后 `build_graph(enable_human_review=True)`，
-outline 之后的条件边把流程引到这个节点；默认关闭时节点完全不执行。
+架构（LangGraph 1.2.11 HITL 正统写法）：
+- 节点内调用 `interrupt({...})` 暂停图，invoke 返回 {"__interrupt__": (Interrupt(value=...),)}
+- 客户端读取 payload，交互后以 Command(resume={...}) 续跑；resume 后节点从头重执行
+- resume 载荷三种 action：
+    confirm  → 确认大纲，继续写作
+    replace  → 用户粘贴的完整新大纲，直接采用
+    revise   → 一段修改意见；本节点把 review_feedback 写入 state，经条件边
+               回环重新进入本节点 → 按意见 LLM 重写大纲 → 再次 interrupt 展示确认
+- 多轮修改 = interrupt → resume(revise) → 回环 → interrupt → resume(confirm) 的循环，
+  完全由 LangGraph 控制，不再用节点内同步 input()（那会阻塞整个图、无法断点续跑）。
 
-交互走 stderr（`print(..., file=sys.stderr)`），保持 stdout 只给成品文章——
-这是 main.py 的既有约定（`> out.md` 重定向时交互提示不会混进产物）。
+注意：interrupt 必须配 checkpointer（graph.py 里 compile(checkpointer=...)），
+否则会直接报错。交互提示由 main.py 统一走 stderr，保持 stdout 只给成品文章。
 """
 import logging
-import sys
+
+from langgraph.types import interrupt
 
 from llm import call_llm
 from prompts import REVISE_OUTLINE_PROMPT
 from state import ArticleState
 
 logger = logging.getLogger(__name__)
-
-_EXIT_COMMANDS = {"q", "quit", "exit"}
-
-
-def _print_outline(outline: str) -> None:
-    """把当前大纲打印到 stderr（预览，不是产物）。"""
-    print("\n👀 人工审阅大纲（--human-review 已开启）：", file=sys.stderr)
-    print("----------------------------------------", file=sys.stderr)
-    print(outline, file=sys.stderr)
-    print("----------------------------------------", file=sys.stderr)
-
-
-def _print_help() -> None:
-    print("  [回车]          确认大纲，继续写作", file=sys.stderr)
-    print("  [输入文字]      作为修改意见，重新生成大纲", file=sys.stderr)
-    print("  [# 开头的内容]  视为你粘贴的完整新大纲，直接采用", file=sys.stderr)
-    print("  [q]             退出", file=sys.stderr)
 
 
 def _revise_outline(topic: str, outline: str, feedback: str) -> str:
@@ -44,37 +37,31 @@ def _revise_outline(topic: str, outline: str, feedback: str) -> str:
 
 
 def human_review_node(state: ArticleState) -> dict:
-    """人工审阅大纲：打印大纲 → 循环等待确认/修改 → 返回最终 outline。
+    """人工审阅大纲：按需重写 → interrupt 暂停展示 → 按 resume 载荷决定下一步。
 
-    返回 `{"outline": outline}` 覆盖 ArticleState.outline（普通 str，直接覆盖）。
-    打回重写循环（split ← edit）不经过本节点，人工确认只发生一次。
+    返回 dict 写入主图 state；review_feedback 非 None 时条件边 route_review
+    会把流程引回本节点再做一轮确认，None 则放行到 split。
     """
     logger.info("→ 人工审阅大纲（--human-review）…")
-    outline = state.get("outline", "")
-    _print_outline(outline)
-    _print_help()
-
-    while True:
-        try:
-            raw = input()
-        except EOFError:
-            # stdin 被关闭（如管道输入提前结束），按确认处理，避免卡死流程
-            break
-        cmd = raw.strip()
-        if cmd.lower() in _EXIT_COMMANDS:
-            sys.exit(0)
-        if not cmd:
-            break  # 直接回车：确认通过
-        if cmd.startswith("#"):
-            # 用户粘贴的完整新大纲，直接采用并重新展示供确认
-            outline = cmd
-            _print_outline(outline)
-            _print_help()
-            continue
-        # 其余输入视为修改意见，交给 LLM 重写大纲后再展示一次
+    outline = state["outline"]
+    feedback = state.get("review_feedback")
+    if feedback:
+        # 第二次（或更多次）进入：先按上轮修改意见重写大纲，再展示确认
         logger.info("  ✍️ 按人工修改意见重新生成大纲…")
-        outline = _revise_outline(state.get("topic", ""), outline, cmd)
-        _print_outline(outline)
-        _print_help()
+        outline = _revise_outline(state["topic"], outline, feedback)
 
-    return {"outline": outline}
+    decision = interrupt(
+        {
+            "type": "outline_review",
+            "topic": state["topic"],
+            "outline": outline,
+        }
+    )
+    action = decision.get("action", "confirm")
+    if action == "confirm":
+        return {"outline": outline, "review_feedback": None}
+    if action == "replace":
+        # 用户粘贴的完整新大纲，直接采用（不调 LLM）
+        return {"outline": decision.get("outline", outline), "review_feedback": None}
+    # revise：把意见写进 state，条件边回环到本节点重写后再确认
+    return {"outline": outline, "review_feedback": decision.get("feedback")}

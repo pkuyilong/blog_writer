@@ -30,7 +30,17 @@ def route_outline(state: ArticleState, enable: bool = False) -> str:
     return "human_review" if enable else "split"
 
 
-def build_graph(enable_human_review: bool = False):
+def route_review(state: ArticleState) -> str:
+    """条件边（human_review 后）：有修改意见（review_feedback）→ 回环重写再确认；否则 → split。
+
+    多轮 HITL 的关键：用户输入修改意见时，human_review_node 把意见写进
+    state["review_feedback"]，本边把流程引回 human_review 节点（节点开头会按
+    意见 LLM 重写大纲再 interrupt 一次）；确认后 feedback 被清空，放行 split。
+    """
+    return "human_review" if state.get("review_feedback") else "split"
+
+
+def build_graph(enable_human_review: bool = False, checkpointer=None):
     """组装流水线：大纲子智能体 →（可选人工介入）→ 拆分章节 → 并发写作 → 合并 → 审校。
 
     其中 "outline" 是一个编译好的独立子图（agents/outliner.py）：自包含地完成
@@ -45,6 +55,9 @@ def build_graph(enable_human_review: bool = False):
     并行触发 write_section 多次 → merge 按序拼装成 draft。审校不合格打回时
     fan_out 只重写 failed_sections 里的问题章节，其余章节草稿保留。
     LangGraph 会根据环境变量自动向 LangSmith 上报执行过程（见 langsmith_config.py）。
+
+    checkpointer（MemorySaver/SqliteSaver 等）传给 compile()：它提供 checkpoint 持久化，
+    interrupt() 人工介入、--resume 断点续跑都依赖它。传 None 时图无状态（不能中断/续跑）。
     """
     # 校验 LangSmith 配置并设置项目名（未配置时仅打印提示，不影响运行）
     setup_langsmith(project_name="blog_writer")
@@ -64,7 +77,11 @@ def build_graph(enable_human_review: bool = False):
         partial(route_outline, enable=enable_human_review),
         {"human_review": "human_review", "split": "split"},
     )
-    graph.add_edge("human_review", "split")
+    graph.add_conditional_edges(
+        "human_review",
+        route_review,
+        {"human_review": "human_review", "split": "split"},
+    )
     graph.add_conditional_edges("split", fan_out_write)  # 返回 [Send(...)] 或 "merge"
     graph.add_edge("write_section", "merge")
     graph.add_edge("merge", "edit")
@@ -73,4 +90,4 @@ def build_graph(enable_human_review: bool = False):
         should_continue,
         {"rewrite": "split", "end": END},
     )
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

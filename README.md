@@ -2,7 +2,7 @@
 
 一个基于 **LangGraph** 的初级多 Agent 项目：给定一个题目，自动完成中文**科普文章**的创作。
 
-三个 Agent（调研/选题 → 写作 → 审校/润色）依次协作，共享一份状态。LLM 通过 **DeepSeek V4 Flash**（`deepseek-v4-flash`，OpenAI 兼容端点）调用，调研 Agent 通过 **DuckDuckGo** 联网搜索真实资料，并对检索内容做 LLM 审查，保证素材真实可靠。
+三个 Agent（大纲子智能体（调研选题一体）→ 写作 → 审校/润色）依次协作，共享一份状态。LLM 通过 **DeepSeek V4 Flash**（`deepseek-v4-flash`，OpenAI 兼容端点）调用，调研 Agent 通过 **DuckDuckGo** 联网搜索真实资料，并对检索内容做 LLM 审查，保证素材真实可靠。
 
 ## 目录
 
@@ -14,9 +14,8 @@
 - [配置 API Key](#配置-api-key)
 - [运行](#运行)
 - [工作原理](#工作原理)
-- [常见问题](#常见问题)
 - [重大改动记录](#重大改动记录)
-- [学习与扩展方向](#学习与扩展方向)
+- [待办事项](#待办事项)
 
 ## 功能特性
 
@@ -44,7 +43,7 @@
 ```
 
 - **大纲子智能体**（自包含独立子图）：一次到位——① 让模型一次提出 3-5 个**具体聚焦**的查询，**并发**调用 `web_search`（DuckDuckGo，`region=cn-zh`）联网搜索；② 用 `REVIEWER_PROMPT` 让 LLM **审查搜索结果**，剔除营销味/宽泛/脏数据，整理出可靠素材；③ 基于素材生成提纲并自检（非空 + 够长）。**素材不足会自动补搜（≤2 轮），提纲不合格会换提示重试（≤2 次），仍不行用自身知识兜底**——搜索、审查、提纲三者闭环，保证返回的提纲一定可用。
-- **人工确认（可选）**：加 `--human-review` 后，大纲生成完会停下展示提纲供你确认——回车通过 / 输入修改意见重新生成 / `#` 开头粘贴自己的完整大纲 / `q` 退出；不加该参数则全自动、完全跳过。
+- **人工确认（可选）**：加 `--human-review` 后，大纲生成完会停下展示提纲供你确认——回车通过 / 输入修改意见重新生成 / `#` 开头粘贴自己的完整大纲 / `q` 退出（稍后可用 `--resume` 续跑）；不加该参数则全自动、完全跳过。
 - **拆分章节**：把提纲拆成 5-7 个结构化章节（标题 + 要点 + 对应素材）。
 - **并行写作**：各章节**并发**扩写成 Markdown（`##` 小节），再按章节顺序合并成完整文章；被打回时结合审校意见修改。
 - **审校/润色**：检查错别字、语病，给出质量分（0-100），指出问题章节并给出**每章专属**的修改意见；润色后输出全文（保持 Markdown 标题结构）；不合格则**只打回问题章节重写**（最多 2 次），这就是图中的"条件分支 + 循环"。
@@ -53,20 +52,22 @@
 
 ```
 blog_writer/
-├── requirements.txt        # langgraph, openai, ddgs, langsmith
+├── requirements.txt        # langgraph, langgraph-checkpoint-sqlite, openai, ddgs, langsmith
 ├── state.py                # ArticleState：节点间共享的状态定义
 ├── llm.py                  # DeepSeek 调用封装 call_llm() / chat()（@traceable 上报 LangSmith）
 ├── prompts.py              # 各 Agent 的中文 system prompt（含 REVIEWER_PROMPT 素材审查）
+├── logging_config.py       # 统一日志：stderr 简洁 + 文件详细，--verbose 控制级别
 ├── langsmith_config.py     # LangSmith 配置：校验环境变量、读取 .env
 ├── .env.example            # 环境变量模板（复制为 .env 填写 Key）
 ├── agents/
 │   ├── __init__.py
 │   ├── tools.py            # web_search 联网搜索工具（DuckDuckGo，region=cn-zh + 标题清洗）
 │   ├── outliner.py         # 大纲子智能体（自包含子图：搜索→审查→生成→自检→补搜/重试→兜底）
+│   ├── human_review.py     # 人工介入节点：interrupt() 暂停 + Command(resume) 续跑（--human-review）
 │   ├── writer.py           # 拆章 split / 并行写章节 write_section / 合并 merge
 │   └── editor.py           # 审校/润色节点（JSON 结构化输出，含问题章节）
-├── graph.py                # LangGraph 编排：大纲 → 拆章 → 并行写 → 合并 → 审校（含打回循环）
-└── main.py                 # CLI 入口
+├── graph.py                # LangGraph 编排：大纲 →（人工确认）→ 拆章 → 并行写 → 合并 → 审校（含打回循环）
+└── main.py                 # CLI 入口（交互循环 + --resume 断点续跑 + checkpointer 装配）
 ```
 
 ## 环境要求
@@ -104,7 +105,7 @@ export LANGCHAIN_API_KEY=lsv2_你的Key   # 在 https://smith.langchain.com 生�
 export LANGCHAIN_PROJECT=blog_writer
 ```
 
-未配置时程序正常运行、不做追踪。详细说明见 `LANGSMITH.md`。
+未配置时程序正常运行、不做追踪。
 
 ## 运行
 
@@ -134,7 +135,14 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
   [回车]          确认大纲，继续写作
   [输入文字]      作为修改意见，重新生成大纲
   [# 开头的内容]  视为你粘贴的完整新大纲，直接采用
-  [q]             退出
+  [q]             退出（稍后可用 `--resume` 从断点继续）
+```
+
+断点续跑：每次运行会生成一个 `thread_id`（日志开头可见）。中途退出（`q` / Ctrl+C / 断电）后，用同一 thread_id 从上次中断点接着写，已生成的大纲、素材、章节草稿都不丢失：
+
+```bash
+python main.py --resume <thread_id>   # 从断点继续（带相同的 --human-review 参数）
+python main.py "题目" --human-review --in-memory   # 对比：进程内 checkpointer，退出即失
 ```
 
 运行时会依次显示各阶段提示：
@@ -173,6 +181,7 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
    | `quality_score` | 审校节点 | 质量分（0-100） |
    | `passed` | 审校节点 | 是否通过质量检查 |
    | `revision_count` | 审校节点 | 已审校次数（控制循环上限） |
+   | `review_feedback` | 人工介入节点 | 人工修改意见；有值时回 `human_review` 先重写大纲再二次确认 |
 
 2. **编排（`graph.py`）**：用 `StateGraph` 串联节点，审校后通过条件边 `should_continue` 决定结束还是打回重写。
 
@@ -186,7 +195,8 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
    graph.add_edge(START, "outline")
    graph.add_conditional_edges("outline", route_outline,    # --human-review 开关路由
                                {"human_review": "human_review", "split": "split"})
-   graph.add_edge("human_review", "split")                 # 人工确认后进入拆章
+   graph.add_conditional_edges("human_review", route_review,  # 有意见→回 human_review 重写；无→split
+                               {"human_review": "human_review", "split": "split"})
    graph.add_conditional_edges("split", fan_out_write)     # 返回 [Send(...)×N] 并行写各章节
    graph.add_edge("write_section", "merge")
    graph.add_edge("merge", "edit")
@@ -194,7 +204,7 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
                                {"rewrite": "split", "end": END})
    ```
 
-   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `split`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（人工确认/修改大纲）再到 `split`；默认关闭直接到 `split`，该节点完全不执行。
+   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `split`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（`interrupt()` 暂停展示大纲）再到 `split`；用户输入修改意见时经条件边 `route_review` 回 `human_review` 先重写大纲、再二次确认；默认关闭直接到 `split`，该节点完全不执行。
 
 3. **大纲子智能体（`agents/outliner.py`）**：一个编译好的**自包含子图**，挂到主图的 `outline` 节点，负责"检索 + 生成提纲"一体：
    - **搜索**：把对话交给模型（带 `web_search` 工具），模型一次提出 3-5 个具体查询，用 `ThreadPoolExecutor` **并发**执行搜索（上限 4）；
@@ -213,6 +223,14 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v2.0 — 正统 Human-in-the-Loop：interrupt + checkpoint 断点续跑
+
+- **从同步 `input()` 升级为 LangGraph 正统 HITL**：`agents/human_review.py` 改用 `interrupt()` 暂停图、`Command(resume=...)` 续跑；交互逻辑（回车确认 / 意见重写 / `#` 粘贴大纲 / `q` 退出）移到 `main.py` 的统一 invoke 循环，提示仍走 stderr。
+- **checkpoint 持久化**：默认 `SqliteSaver` 写 `.checkpoints/blog_writer.db`（`--in-memory` 可选 `MemorySaver` 对比学习）；每次运行生成 `thread_id` 作寻址单位。
+- **断点续跑 `--resume <thread_id>`**：长文写作中途（`q` 退出 / Ctrl+C / 断电）后，用同一 thread_id 从上次中断点接着写，已生成的大纲/素材/章节草稿不丢失。
+- **多轮修改自环**：输入修改意见后经 `route_review` 条件边回 `human_review` 节点，先按意见重写大纲、再二次确认（`review_feedback` 状态字段驱动）。
+- **踩过的坑**：`SqliteSaver.from_conn_string()` 返回 context manager，必须 `with` 解包取实例再传 `compile(checkpointer=...)`；`interrupt()` 无 checkpointer 时可暂停但状态不持久化、不可跨进程 resume。
 
 ### v1.9 — 可选人工介入（Human-in-the-Loop）：大纲确认环节
 
@@ -284,7 +302,7 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
 
 ### P2 — 远期
 
-- [x] **Human-in-the-loop 中断点**（已实现 v1.9，大纲后介入）：`--human-review` 开关在**大纲后**暂停人工确认/修改（同步 `input()`，未用 `interrupt()`）。可选扩展：在 `merge` 后加第二介入点预览全文草稿，选"继续审校 / 直接输出 / 打回某章重写"，届时再学习 checkpoint + interrupt 机制。
+- [x] **Human-in-the-loop 中断点**（已实现 v2.0，大纲后介入 + checkpoint 断点续跑）：`--human-review` 走 LangGraph 正统 `interrupt()` + `Command(resume=...)`，默认 `SqliteSaver` 落盘；`q` 退出后可用 `--resume <thread_id>` 跨进程续跑；有修改意见时经 `route_review` 自环先重写大纲再二次确认。可选扩展：在 `merge` 后加第二介入点预览全文草稿，选"继续审校 / 直接输出 / 打回某章重写"。
 - [ ] **多视角审校（Judge Panel）**：3 个并行审校角色——语言编辑（语病/流畅度）、事实核查（数据/引用准确性）、结构编辑（逻辑/衔接），独立打分取多数意见。
 - [ ] **搜索素材缓存 + 知识复用**：搜索结果按 query hash 缓存到本地，过期 24h，跨文章复用，减少重复搜索。
 
