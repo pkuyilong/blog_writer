@@ -13,6 +13,7 @@
 补搜 / 重试计数（search_round / outline_attempt）都是子图私有键，不会泄漏
 回父图 state（已对 langgraph 1.2.11 实测验证）。
 """
+
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +26,7 @@ from prompts import (
     FALLBACK_OUTLINE_PROMPT,
     OUTLINER_PROMPT,
     RESEARCHER_PROMPT,
-    REVIEWER_PROMPT,
+    MATERIAL_REVIEW_PROMPT,
 )
 from agents.tools import WEB_SEARCH_TOOL, web_search
 
@@ -61,7 +62,7 @@ class OutlineState(TypedDict):
     materials: str
     outline: str
     outline_attempt: int  # 私有：提纲重试计数
-    search_round: int     # 私有：搜索轮次计数
+    search_round: int  # 私有：搜索轮次计数
 
 
 def _usable(outline: str) -> bool:
@@ -88,7 +89,9 @@ def search(state: OutlineState) -> dict:
     """搜索素材并审查：让模型规划查询 → 执行搜索 → 审查筛选，产出 materials。"""
     round_n = state.get("search_round", 0) + 1
     logger.info(f"  🔍 大纲子智能体搜索素材（第 {round_n} 轮）…")
-    messages = [{"role": "user", "content": f"文章题目：{state['topic']}\n请开始调研。"}]
+    messages = [
+        {"role": "user", "content": f"文章题目：{state['topic']}\n请开始调研。"}
+    ]
 
     # 阶段一：让模型规划搜索（一次可请求多个查询），并执行全部搜索
     response = chat(RESEARCHER_PROMPT, messages, tools=[WEB_SEARCH_TOOL])
@@ -118,12 +121,14 @@ def search(state: OutlineState) -> dict:
         # 并行执行全部查询；executor.map 保持输入顺序返回结果，tool_call_id 一一对应
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_SEARCHES) as ex:
             for tc_id, content in ex.map(_run_search, msg.tool_calls):
-                messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc_id, "content": content}
+                )
 
         # 阶段二：让模型审查搜索结果，筛选出可靠素材
         logger.info("  🧐 审查搜索结果素材…")
         reviewed = chat(
-            REVIEWER_PROMPT,
+            MATERIAL_REVIEW_PROMPT,
             messages
             + [
                 {
@@ -158,11 +163,11 @@ def generate(state: OutlineState) -> dict:
     """基于素材生成/重试提纲；outline_attempt 自增，重试时提示模型补全。"""
     attempt = state.get("outline_attempt", 0) + 1
     logger.info(f"  📋 大纲子智能体生成提纲（第 {attempt} 次）…")
-    user_content = f"文章题目：{state['topic']}\n\n【素材】\n{state.get('materials', '')}"
+    user_content = (
+        f"文章题目：{state['topic']}\n\n【素材】\n{state.get('materials', '')}"
+    )
     if attempt > 1:
-        user_content += (
-            "\n\n（上一版提纲不够完整/可用，请基于素材输出一份更完整、可直接支撑写作的提纲。）"
-        )
+        user_content += "\n\n（上一版提纲不够完整/可用，请基于素材输出一份更完整、可直接支撑写作的提纲。）"
     resp = chat(OUTLINER_PROMPT, [{"role": "user", "content": user_content}], tools=[])
     outline = resp.choices[0].message.content or ""
     return {"outline": outline, "outline_attempt": attempt}

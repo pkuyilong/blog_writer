@@ -5,6 +5,10 @@ __pycache__/
 
 .gitignore
 
+node_modules
+session*
+.session*
+package*json
 # C extensions
 *.so
 .env

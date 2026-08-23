@@ -8,9 +8,7 @@ LangSmith 用于追踪 agent 执行过程、状态变化、token 使用情况等
   - LANGCHAIN_API_KEY=lsv2_xxx...
   - LANGCHAIN_PROJECT=blog_writer（可选，指定项目名）
 
-两种设置环境变量的方式任选其一：
-  1. 在 shell 里 export（见 LANGSMITH.md）
-  2. 复制 .env.example 为 .env 并填写（本模块启动时会自动读取）
+复制 .env.example 为 .env 并填写（本模块启动时会自动读取）
 
 首次使用需去 https://smith.langchain.com 注册并获取 API Key。
 不配置时不会产生任何追踪开销。

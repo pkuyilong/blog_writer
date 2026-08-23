@@ -29,7 +29,7 @@ class ArticleState(TypedDict):
 
     topic: str                          # 用户输入的题目
     outline: str                        # 大纲子智能体产出的可用提纲
-    review_feedback: str | None         # 人工修改意见；human_review 收到后先重写大纲再二次确认（HITL 自环）
+    outline_review_feedback: str | None         # 人工修改意见；human_review 收到后先重写大纲再二次确认（HITL 自环）
     sections: list[Section]             # split 拆出的章节 [{title, points, materials}]
     section_drafts: Annotated[dict[str, str], _merge_dicts]   # 章节id → 草稿
     failed_sections: list[dict]         # 打回时需重写的章节 [{id, feedback}]（审校写入）
