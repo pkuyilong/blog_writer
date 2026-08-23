@@ -29,6 +29,8 @@ def split_sections(state: ArticleState) -> dict:
         # 兜底：拆章失败时至少给一个章节，避免并发分支为空
         print("  ⚠ 章节拆分失败，回退为单章节")
         sections = [{"title": state["topic"], "points": [], "materials": []}]
+    # 给每个章节补 id（enumerate 顺序编号）：section_drafts 以它作 key，打回时按 id 匹配
+    sections = [dict(s, id=i) for i, s in enumerate(sections)]
     print(f"  📑 已拆分为 {len(sections)} 个章节")
     return {"sections": sections}
 
@@ -36,48 +38,56 @@ def split_sections(state: ArticleState) -> dict:
 def fan_out_write(state: ArticleState):
     """条件边（挂在 split 后）：返回 Send 列表触发并行写章节，或 "merge" 直接合并。
 
-    首次写作：Send 全部章节；打回重写：只 Send failed_sections 里的问题章节，
-    并把该章节专属的审校意见（feedback）一并传给 write_section，各章互不串味。
+    首次写作：Send 全部章节；打回重写：只 Send failed_sections 里的问题章节
+    （按 section["id"] 匹配），并把该章节专属的审校意见（feedback）一并传给
+    write_section，各章互不串味。
     """
     sections = state.get("sections", [])
     if not sections:
         return "merge"
     if state.get("revision_count", 0) > 0 and state.get("failed_sections"):
         failed = state["failed_sections"]
+        by_id = {sec["id"]: sec for sec in sections}
         feedback_map = {
             item["id"]: item.get("feedback", "")
             for item in failed
             if isinstance(item, dict) and "id" in item
         }
-        targets = [i for i in feedback_map if 0 <= i < len(sections)]
+        targets = []
+        for fid in feedback_map:
+            sec = by_id.get(fid)
+            if sec is not None:
+                targets.append(sec)
         if not targets:
             return "merge"
-        print(f"  🔁 只重写问题章节：{targets}")
+        print(f"  🔁 只重写问题章节：{[sec['id'] for sec in targets]}")
     else:
         feedback_map = {}
-        targets = list(range(len(sections)))
+        targets = sections
 
     return [
         Send(
             "write_section",
             {
-                "section_id": i,
-                "section": sections[i],
+                "section": sec,
                 "topic": state.get("topic", ""),
-                "feedback": feedback_map.get(i, ""),
+                "feedback": feedback_map.get(sec["id"], ""),
             },
         )
-        for i in targets
+        for sec in targets
     ]
 
 
-def write_section(state: ArticleState) -> dict:
+def write_section(state: dict) -> dict:
     """写单个章节（被 Send 并行调用多次）。返回 {"section_drafts": {id: text}}。
 
-    打回重写时 state["feedback"] 是该章节专属的审校意见（首次写作时为空串）。
+    state 由 fan_out_write 的 Send payload 注入，只含三个键：
+    section / topic / feedback，不是完整 ArticleState；章节 id 在
+    state["section"]["id"] 里。打回重写时 state["feedback"] 是该章节
+    专属的审校意见（首次写作时为空串）。
     """
-    sid = state["section_id"]
     section = state["section"]
+    sid = section["id"]
     print(f"→ 写作章节[{sid}]：{section['title']}…")
     user_content = (
         f"文章主题：{state.get('topic', '')}\n\n"
@@ -95,8 +105,8 @@ def write_section(state: ArticleState) -> dict:
 def merge_sections(state: ArticleState) -> dict:
     """按 sections 顺序拼装各章节草稿，生成整篇 draft。"""
     parts = []
-    for i, sec in enumerate(state.get("sections", [])):
-        text = state.get("section_drafts", {}).get(str(i))
+    for sec in state.get("sections", []):
+        text = state.get("section_drafts", {}).get(str(sec["id"]))
         if text is None:
             text = f"## {sec.get('title', '')}\n\n（本章未生成）"
         parts.append(text)

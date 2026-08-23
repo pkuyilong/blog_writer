@@ -144,7 +144,7 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
    |---|---|---|
    | `topic` | 用户（`main.py`） | 输入的题目 |
    | `outline` | 大纲子智能体 | 可用的提纲 |
-   | `sections` | 拆章节点 | 拆分出的章节列表（标题 + 要点 + 素材） |
+   | `sections` | 拆章节点 | 拆分出的章节列表（`id` + 标题 + 要点 + 素材，`id` 由程序按顺序补） |
    | `section_drafts` | 写章节节点 | 各章节草稿（并行写入，按 id 合并） |
    | `failed_sections` | 审校节点 | 打回时需重写的章节及各自修改意见 [{id, feedback}] |
    | `draft` | 合并节点 | 合并后的全文草稿 |
@@ -189,6 +189,11 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v1.6 — Section 自带 id，"章节"成为自洽对象
+
+- **`Section` 结构加 `id` 字段**（`state.py`）：章节 = `{id, title, points, materials}`。`id` 由 `split_sections` 程序补（`enumerate` 顺序编号），不依赖 LLM 输出，杜绝编号重复/缺失。
+- **Send payload 缩到 3 个键**：`fan_out_write` 不再并列传 `section_id` + `section`，id 直接存在 `section["id"]` 里；`write_section` / `merge_sections` 都改为按 `section["id"]` 读写，`section_drafts` 的 key 与章节本体绑定、不再依赖列表位置。
 
 ### v1.5 — 审校意见按章节拆分（去掉全局 revision_feedback）
 
