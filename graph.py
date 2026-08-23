@@ -6,7 +6,8 @@ from langgraph.graph import START, END, StateGraph
 from agents.editor import editor_node
 from agents.human_review import human_review_node
 from agents.outliner import build_outliner
-from agents.writer import fan_out_write, merge_sections, split_sections, write_section
+from agents.section_writer import build_section_writer
+from agents.writer import fan_out_write, merge_sections, split_sections
 from langsmith_config import setup_langsmith
 from state import ArticleState
 
@@ -31,13 +32,13 @@ def route_outline(state: ArticleState, enable: bool = False) -> str:
 
 
 def route_review(state: ArticleState) -> str:
-    """条件边（human_review 后）：有修改意见（review_feedback）→ 回环重写再确认；否则 → split。
+    """条件边（human_review 后）：有修改意见（outline_review_feedback）→ 回环重写再确认；否则 → split。
 
     多轮 HITL 的关键：用户输入修改意见时，human_review_node 把意见写进
-    state["review_feedback"]，本边把流程引回 human_review 节点（节点开头会按
+    state["outline_review_feedback"]，本边把流程引回 human_review 节点（节点开头会按
     意见 LLM 重写大纲再 interrupt 一次）；确认后 feedback 被清空，放行 split。
     """
-    return "human_review" if state.get("review_feedback") else "split"
+    return "human_review" if state.get("outline_review_feedback") else "split"
 
 
 def build_graph(enable_human_review: bool = False, checkpointer=None):
@@ -51,9 +52,10 @@ def build_graph(enable_human_review: bool = False, checkpointer=None):
     由人工确认/修改大纲再继续（对应 CLI 的 --human-review 开关）；默认关闭，
     图与全自动版本完全一致（human_review 节点不执行）。
 
-    写作阶段按章节并行（Send map-reduce）：split 拆章节 → fan_out 条件边
-    并行触发 write_section 多次 → merge 按序拼装成 draft。审校不合格打回时
-    fan_out 只重写 failed_sections 里的问题章节，其余章节草稿保留。
+    写作阶段按章节并行（Send map-reduce）：split 拆章节 → fan_out 条件边并行触发
+    write_section 多次（每次是 section_writer 自包含子图：写 → 启发式自检 → 条件重写）
+    → merge 按序拼装成 draft。审校不合格打回时 fan_out 只重写 failed_sections 里的
+    问题章节，其余章节草稿保留。
     LangGraph 会根据环境变量自动向 LangSmith 上报执行过程（见 langsmith_config.py）。
 
     checkpointer（MemorySaver/SqliteSaver 等）传给 compile()：它提供 checkpoint 持久化，
@@ -66,7 +68,7 @@ def build_graph(enable_human_review: bool = False, checkpointer=None):
     graph.add_node("outline", build_outliner())  # 大纲子智能体（自包含子图）
     graph.add_node("human_review", human_review_node)  # 可选：人工确认/修改大纲
     graph.add_node("split", split_sections)
-    graph.add_node("write_section", write_section)
+    graph.add_node("write_section", build_section_writer())  # 章节写作子智能体（自包含子图）
     graph.add_node("merge", merge_sections)
     graph.add_node("edit", editor_node)
 

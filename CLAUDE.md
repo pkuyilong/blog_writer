@@ -8,7 +8,7 @@
 
 - LLM：**DeepSeek V4 Flash**（`deepseek-v4-flash`），通过 **OpenAI 兼容端点**调用（`base_url=https://api.deepseek.com`）。**不是 Anthropic API**，别按 Claude SDK 写代码。
 - 搜索：**DuckDuckGo**（`ddgs` 库，免费无需 Key），`region=cn-zh` 提升中文结果质量。
-- 主图节点：`outline`（子图）→ `split` → `write_section`（Send 并行 ×N）→ `merge` → `edit`（条件边打回只重写问题章节，最多 2 次）。
+- 主图节点：`outline`（子图）→ `split` → `write_section`（子图，Send 并行 ×N）→ `merge` → `edit`（条件边打回只重写问题章节，最多 2 次）。
 - 搜索：outliner 子图内 **ThreadPool 并行**（`MAX_PARALLEL_SEARCHES=4`）；写作按章节 **Send 图级并行**。
 
 ## 常用命令
@@ -38,11 +38,11 @@ python main.py "题目" --human-review --in-memory
 ## 架构与数据流
 
 ```
-主图（graph.py）：START → outline(子图) → [human_review?] → split → fan_out ─Send×N─→ write_section → merge → edit
+主图（graph.py）：START → outline(子图) → [human_review?] → split → fan_out ─Send×N─→ write_section(子图) → merge → edit
                                                                     ↑                        │
                                                     rewrite（只重写问题章节）←（should_continue）┘
   · human_review（可选，--human-review 开关经条件边启用）：大纲后 interrupt() 暂停，把大纲交给 main.py 交互循环；
-    回车确认 / 意见重写 / #粘贴后 Command(resume=...) 续跑；有意见（review_feedback）经 route_review 条件边回环
+    回车确认 / 意见重写 / #粘贴后 Command(resume=...) 续跑；有意见（outline_review_feedback）经 route_review 条件边回环
     重写再二次确认；默认关闭完全不执行
   · split：LLM 把 outline 文本拆成 [{title, points, materials}]（revision_count>0 时复用，不重复调 LLM）
   · fan_out（split 的条件边）：返回 [Send("write_section", ...)×N]；打回时只 Send failed_sections 里的章节
@@ -68,9 +68,10 @@ outline 子图（agents/outliner.py，自包含）：
 | `prompts.py` | 各 Agent 中文 system prompt：RESEARCHER / REVIEWER / OUTLINER / FALLBACK_OUTLINE / REVISE_OUTLINE / SPLIT / WRITE_SECTION / EDITOR |
 | `agents/tools.py` | `web_search()` + `WEB_SEARCH_TOOL`（OpenAI 兼容 function schema） |
 | `agents/outliner.py` | **大纲子智能体**：自包含子图（搜索→审查→生成→自检→补搜/重试/兜底）；搜索多查询 ThreadPool 并行 |
-| `agents/writer.py` | `split_sections`（拆章，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `write_section`（并行写单章）/ `merge_sections`（按序拼装） |
-| `agents/editor.py` | 审校节点：`json_mode=True` 输出 JSON（score/passed/revised_article/**failed_sections**[{id,feedback}]） |
-| `agents/human_review.py` | **人工介入节点**：`interrupt()` 暂停把大纲交给客户端，按 `Command(resume=...)` 的 action（confirm/revise/replace）决定下一步；revise 时把 `review_feedback` 写进 state、经 `route_review` 条件边回环，节点开头按意见重写（REVISE_OUTLINE_PROMPT）再二次确认；`build_graph(enable_human_review=True)` 经条件边启用 |
+| `agents/writer.py` | 程序性节点：`split_sections`（拆章，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `merge_sections`（按序拼装）；**不含写作 LLM** |
+| `agents/section_writer.py` | **章节写作子智能体**（自包含子图，挂 `write_section` 节点）：`write`（初稿/重写）→ `self_check`（启发式自检：篇幅/标题/要点）→ `should_rewrite`（条件重写，`MAX_SECTION_ATTEMPTS` 上限）→ `emit`（输出 `section_drafts`）；`output_schema` 限定子图只输出该键 |
+| `agents/editor.py` | 审校节点：`json_mode=True` 输出 JSON（score/passed/revised_article/**failed_sections**[{id,feedback}]）；解析失败重试 `EDITOR_MAX_RETRIES` 次，耗尽才保守通过 |
+| `agents/human_review.py` | **人工介入节点**：`interrupt()` 暂停把大纲交给客户端，按 `Command(resume=...)` 的 action（confirm/revise/replace）决定下一步；revise 时把 `outline_review_feedback` 写进 state、经 `route_review` 条件边回环，节点开头按意见重写（REVISE_OUTLINE_PROMPT）再二次确认；`build_graph(enable_human_review=True)` 经条件边启用 |
 | `langsmith_config.py` | LangSmith 配置：读 `.env`、校验环境变量、设置项目名 |
 | `logging_config.py` | 统一日志：所有模块用 `logging` 替代 print；stderr 简洁输出（保留 emoji 观感）+ 文件（默认 `blog_writer.log`）详细追踪；`--verbose` 控制终端级别；`setup_logging()` 幂等 |
 
@@ -89,7 +90,7 @@ outline 子图（agents/outliner.py，自包含）：
 
 4. **审查失败降级**：`search` 节点里，LLM 审查结果不可用（`_materials_ok` 为假）时**退回原始搜索结果**作为素材——这样即使审查坏了，后续 `should_search_again` 还能基于真实内容判断是否补搜。
 
-5. **JSON 模式要求 prompt 里出现 "json" 字样**：DeepSeek 的 `response_format={"type":"json_object"}` 要求 prompt 中包含 "json" 才生效（`EDITOR_PROMPT` 里已满足）。解析失败时 `editor_node` **保守按通过处理**（`passed=True`），避免把流程卡进死循环。
+5. **JSON 模式要求 prompt 里出现 "json" 字样**：DeepSeek 的 `response_format={"type":"json_object"}` 要求 prompt 中包含 "json" 才生效（`EDITOR_PROMPT` 里已满足）。解析失败时 `editor_node` **重试**（`EDITOR_MAX_RETRIES=2`，重试提示含"不是合法 JSON"），重试耗尽才**保守按通过处理**（`passed=True`），避免把流程卡进死循环。`revision_count` 只在节点执行时 +1，不因重试多计。
 
 6. **ReAct 工具调用**：`chat()` 返回完整响应，`agents/outliner.py` 里手动执行 `tool_calls`（逐条 `web_search`），再把 assistant 消息（含 tool_calls）+ tool 结果放回对话交给审查阶段。
 
@@ -101,8 +102,8 @@ outline 子图（agents/outliner.py，自包含）：
 
 10. **人工介入（可选，`--human-review`）——LangGraph 正统 HITL**：`outline` 后条件边路由到 `human_review` 节点，用 **`interrupt()` + `Command(resume=...)`** 协议替代早期版本的节点内同步 `input()`（早期决策笔记见 git 历史）。要点：
     - **必须配 checkpointer**：`build_graph(enable_human_review, checkpointer)` 把 saver 传进 `graph.compile(checkpointer=...)`，interrupt 才有意义。无 checkpointer 时 interrupt 仍返回 `__interrupt__`（可暂停）但不持久化、不可 resume（实测 1.2.11）。
-    - **resume 后节点从头重执行**：所以"按意见重写"逻辑放在 `human_review_node` 开头（读 `state["review_feedback"]` 非空就调 `_revise_outline`），重写后再次 interrupt 展示确认；确认后清空 `review_feedback`。
-    - **多轮修改**：`review_feedback` 非空时 `route_review` 条件边回环 `human_review`，形成 interrupt → resume(revise) → 回环 → interrupt → resume(confirm) 的循环，完全由 LangGraph 控制（不再阻塞节点）。
+    - **resume 后节点从头重执行**：所以"按意见重写"逻辑放在 `human_review_node` 开头（读 `state["outline_review_feedback"]` 非空就调 `_revise_outline`），重写后再次 interrupt 展示确认；确认后清空 `outline_review_feedback`。
+    - **多轮修改**：`outline_review_feedback` 非空时 `route_review` 条件边回环 `human_review`，形成 interrupt → resume(revise) → 回环 → interrupt → resume(confirm) 的循环，完全由 LangGraph 控制（不再阻塞节点）。
     - **`__interrupt__` 返回格式**：invoke 返回 `{"__interrupt__": [Interrupt(value=..., id=...), ...]}`，payload 取 `result["__interrupt__"][0].value`；resume 用 `Command(resume={...})`。
     - **断点续跑（`--resume <thread_id>`）**：SqliteSaver 持久化到 `.checkpoints/`（需 `langgraph-checkpoint-sqlite` 包）。**坑**：`SqliteSaver.from_conn_string(DB)` 返回的是 context manager，必须 `with ... as cp:` 解包后再传给 `compile(checkpointer=cp)`，直接传会报 `TypeError: Invalid checkpointer... Received _GeneratorContextManager`（实测踩坑；MemorySaver 直接 new 即可）。进程退出/Ctrl+C 后，`python main.py --resume <thread_id>` 打开同一 checkpoint（`graph.get_state(config)` 看快照），停在中断处时 `invoke(None)` 会重新触发同一 interrupt 进入交互。**resume 时须与上次带相同的 `--human-review`**，保证图结构一致。
     - **`--in-memory`**：用 MemorySaver（进程内、退出即失）对比 SqliteSaver 的跨进程持久化，纯学习用。
@@ -110,11 +111,20 @@ outline 子图（agents/outliner.py，自包含）：
     - 交互提示由 `main.py` 统一走 stderr（`print(..., file=sys.stderr)`），保持 stdout 只给成品文章（`> out.md` 重定向不混入）。
     - 打回重写循环（split ← edit）不经过该节点；`REVISE_OUTLINE_PROMPT` 不含 "json" 字样（走非 json_mode 的 `call_llm`）。
 
+11. **write_section 升级为自包含子图（"写单章 → 自检 → 条件重写"）**（agents/section_writer.py，挂 `write_section` 节点）：初稿后先用**启发式自检**判断是否合格——篇幅 ≥ `MIN_SECTION_LEN(120)`、以 `## ` 开头，不调 LLM、确定性可测。合格直接结束（**省掉旧版"无条件自我反思一轮"的那次调用**）；不合格且 `write_attempt < MAX_SECTION_ATTEMPTS(2)` 才重写（自检意见塞回生成提示）；达上限接受当前结果（warning 兜底）。
+    - **不做"要点覆盖"子串检查（真实 e2e 两次 100% 误判后移除）**：split 生成的 `points` 是**描述性写作指令**（如"用生活化场景对比早高峰通勤与在家办公的差异"），正文几乎不可能逐字复述——任何固定长度阈值都会误判，两次真实 e2e 中 7 章全部被误判"未覆盖要点"、白白各多付一次重写调用，还把错误意见塞回模型。**要点覆盖是"内容层"检查，与 LLM 自由表达天生不兼容，交给外部 editor 审校**；子图自检只保留篇幅/标题两个确定性检查（宁可漏检，不可误检）。
+
+12. **Send 并行触发编译子图：`output_schema` 限定输出是硬要求**（langgraph 1.2.11 实测踩坑）：fan_out 的 Send payload `{section, topic, feedback}` 直接是子图输入 state；多个子图实例同一 superstep 并行结束时，若子图把输入键（如 topic）**原样写回父图**，父图 topic 是普通键（LastValue），同一 superstep 收到多个值会抛 `INVALID_CONCURRENT_GRAPH_UPDATE`。**解法：`StateGraph(SectionWriterState, output_schema=SectionWriterOutput)` 把子图 output_channels 限定为 `section_drafts`**，冲突从根上消除（父图零改动）。若想给子图加新输出，改 `SectionWriterOutput` 即可。
+
+13. **子图内部键名避免与父图通道重名**：父图 `ArticleState` 有 `draft` 通道，子图内部草稿键若命名 `draft`，会把单章文本写回父图 `draft`、破坏 merge 结果。**硬约束：子图一律用 `section_text`**（`SectionWriterState` 顶部注释列禁用名）。子图私有键（`section_text`/`write_attempt`/`self_check_notes`）与 `ArticleState` 键零重叠，由 output_schema 保证不写回父图。
+
 ## 测试方法
 
 - **确定性控制流测试**：在模块层替换 `O.chat` / `O.web_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。
 - 参考：`/Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py`（23 项检查）。核心断言模式：场景 A（素材够，1 轮收敛，chat=3）、B（补搜，chat=5）、C（两轮失败兜底，chat=5）、D（提纲两次太短兜底）、E（重试收敛，chat=4）、F（私有键不泄漏）、G（主图节点链 + outline 节点是 `CompiledStateGraph`）、H（并行搜索 3 查询）。
-- 按章节并行写作：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_writer.py`（9 项检查）——mock 主图全部 LLM，走完整链路验证：split 调 1 次 → write_section ×N（计数加锁）→ merge 顺序正确 → 审校失败 → 打回只重写问题章节（旧草稿被覆盖、其余保留）。
+- 按章节并行写作：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_writer.py`（16 项检查）——mock 主图全部 LLM，走完整链路验证：split 调 1 次 → write_section 子图 ×N（计数加锁，per-title 版本号断言、不依赖并行执行顺序）→ merge 顺序正确 → 审校失败 → 打回只重写问题章节（旧草稿被覆盖、其余保留、专属意见传递）→ 子图私有键不泄漏。
+- 章节写作子智能体：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_subagent.py`（16 项检查）——mock `agents.section_writer.call_llm`，覆盖首写合格（不触发自检重写，对比旧版无条件反思省 1 次）/ 不合格→重写收敛 / 两次不合格接受 / 审校意见传递 / 要点不做子串检查（避免误判）/ 输出 schema 只暴露 section_drafts。
+- 审校解析重试：`/Users/power/.claude/jobs/4cc34a38/tmp/test_editor_retry.py`（13 项检查）——mock `agents.editor.call_llm`，覆盖首出合法（调 1 次）/ 失败一次后成功（调 2 次、第二次 user_content 含"不是合法 JSON"）/ 连续失败到上限保守通过。
 - 人工介入：`/Users/power/.claude/jobs/4cc34a38/tmp/test_human_review.py`（13 项检查）——mock `agents.human_review.input`（编程序列）与 `call_llm`，单测节点四种输入（回车/意见重写/粘贴大纲/q 退出）+ 整图开关开走通 + 开关关不触发节点。
 - **真实 e2e**：跑 `python main.py "题目" --output out.md`，检查日志出现补搜/重试提示、成品是合法 Markdown、质量分正常。注意真实搜索 + LLM 调用可能超过 5 分钟，超时后转后台即可。
 

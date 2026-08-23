@@ -1,10 +1,16 @@
+"""写作管线节点：拆章（split）→ 并行写章（Send 触发 section_writer 子图）→ 合并。
+
+write_section 的"写单章"职责已下放到 agents/section_writer.py 的章节写作子图
+（初稿 → 启发式自检 → 条件重写）；本模块保留拆章、Send 分发、合并三个程序性节点。
+"""
+
 import json
 import logging
 
 from langgraph.types import Send
 
 from llm import call_llm
-from prompts import SELF_REVIEW_PROMPT, SPLIT_PROMPT, WRITE_SECTION_PROMPT
+from prompts import SPLIT_PROMPT
 from state import ArticleState
 
 logger = logging.getLogger(__name__)
@@ -79,49 +85,6 @@ def fan_out_write(state: ArticleState):
         )
         for sec in targets
     ]
-
-
-def write_section(state: dict) -> dict:
-    """写单个章节（被 Send 并行调用多次）。返回 {"section_drafts": {id: text}}。
-
-    state 由 fan_out_write 的 Send payload 注入，只含三个键：
-    section / topic / feedback，不是完整 ArticleState；章节 id 在
-    state["section"]["id"] 里。打回重写时 state["feedback"] 是该章节
-    专属的审校意见（首次写作时为空串）。
-
-    写完初稿后做一轮**自我反思**（SELF_REVIEW_PROMPT）：让模型审视自己的
-    输出（内容扎实度/语言自然度/科普效果/衔接），直接输出改进后的章节，
-    提升初稿质量，减少外部审校打回次数。
-    """
-    section = state["section"]
-    sid = section["id"]
-    logger.info(f"→ 写作章节[{sid}]：{section['title']}…")
-    user_content = (
-        f"文章主题：{state.get('topic', '')}\n\n"
-        f"【本章节】标题：{section['title']}\n"
-        f"要点：{section.get('points', [])}\n"
-        f"素材：{section.get('materials', [])}"
-    )
-    feedback = state.get("feedback", "")
-    if feedback:
-        user_content += f"\n\n【上轮审校意见】{feedback}\n请逐条针对意见修改本章节。"
-
-    # 第一轮：生成初稿
-    text = call_llm(WRITE_SECTION_PROMPT, user_content)
-
-    # 第二轮：自我反思改进（审视自己刚写的章节 → 输出改进版）
-    logger.info(f"  🔍 自我反思章节[{sid}]…")
-    review_input = (
-        f"文章主题：{state.get('topic', '')}\n\n"
-        f"【本章节】标题：{section['title']}\n"
-        f"要点：{section.get('points', [])}\n\n"
-        f"【初稿】\n{text}"
-    )
-    if feedback:
-        review_input += f"\n\n【上轮审校意见】{feedback}\n请确保改进后仍满足这些要求。"
-    text = call_llm(SELF_REVIEW_PROMPT, review_input)
-
-    return {"section_drafts": {str(sid): text}}
 
 
 def merge_sections(state: ArticleState) -> dict:

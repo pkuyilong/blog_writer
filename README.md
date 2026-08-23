@@ -26,6 +26,7 @@
 - 🧐 **检索内容审查**：搜索结果先交给 LLM 审查（来源可信度 / 信息含量 / 相关度），剔除营销味、宽泛无信息、脏数据内容，再基于可靠素材生成提纲
 - 🎯 **科普定位**：写作要求生活化类比、术语先解释、通俗但有深度；内容以真实素材为准
 - ✍️ **按章节并发写作**：提纲拆成 5-7 个章节，各章节**并行**写作后按序合并成全文，生成更快
+- 🧐 **章节写作子智能体**：每个章节独立完成"初稿 → 自检 → 条件重写"——自检看篇幅/标题/要点覆盖，合格直接通过（省 token），不合格才重写
 - 🔄 审校 Agent 输出质量分（0-100），**不合格打回时只重写问题章节**、每章带专属修改意见，其余保留（最多 2 次）
 - 👀 **可选人工介入**：大纲生成后暂停，由你确认/修改提纲再继续（`--human-review`，默认全自动）
 - 🧩 审校节点使用结构化 JSON 输出，方便程序读取分数/意见与问题章节
@@ -42,10 +43,10 @@
                   （素材不足则补搜 / 提纲不合格则重试）
 ```
 
-- **大纲子智能体**（自包含独立子图）：一次到位——① 让模型一次提出 3-5 个**具体聚焦**的查询，**并发**调用 `web_search`（DuckDuckGo，`region=cn-zh`）联网搜索；② 用 `REVIEWER_PROMPT` 让 LLM **审查搜索结果**，剔除营销味/宽泛/脏数据，整理出可靠素材；③ 基于素材生成提纲并自检（非空 + 够长）。**素材不足会自动补搜（≤2 轮），提纲不合格会换提示重试（≤2 次），仍不行用自身知识兜底**——搜索、审查、提纲三者闭环，保证返回的提纲一定可用。
+- **大纲子智能体**（自包含独立子图）：一次到位——① 让模型一次提出 3-5 个**具体聚焦**的查询，**并发**调用 `web_search`（DuckDuckGo，`region=cn-zh`）联网搜索；② 用 `MATERIAL_REVIEW_PROMPT` 让 LLM **审查搜索结果**，剔除营销味/宽泛/脏数据，整理出可靠素材；③ 基于素材生成提纲并自检（非空 + 够长）。**素材不足会自动补搜（≤2 轮），提纲不合格会换提示重试（≤2 次），仍不行用自身知识兜底**——搜索、审查、提纲三者闭环，保证返回的提纲一定可用。
 - **人工确认（可选）**：加 `--human-review` 后，大纲生成完会停下展示提纲供你确认——回车通过 / 输入修改意见重新生成 / `#` 开头粘贴自己的完整大纲 / `q` 退出（稍后可用 `--resume` 续跑）；不加该参数则全自动、完全跳过。
 - **拆分章节**：把提纲拆成 5-7 个结构化章节（标题 + 要点 + 对应素材）。
-- **并行写作**：各章节**并发**扩写成 Markdown（`##` 小节），再按章节顺序合并成完整文章；被打回时结合审校意见修改。
+- **并行写作（章节子智能体）**：每个章节是一个**自包含子智能体**——并发扩写成 Markdown（`##` 小节）后先**自检**（篇幅 / 标题 / 要点覆盖，不调 LLM），不合格且未到上限则**条件重写**（自检意见作为反馈塞回生成提示），合格才结束。所有章节写完后按序合并成完整文章；被审校打回时结合该章专属意见修改。
 - **审校/润色**：检查错别字、语病，给出质量分（0-100），指出问题章节并给出**每章专属**的修改意见；润色后输出全文（保持 Markdown 标题结构）；不合格则**只打回问题章节重写**（最多 2 次），这就是图中的"条件分支 + 循环"。
 
 ## 项目结构
@@ -55,7 +56,7 @@ blog_writer/
 ├── requirements.txt        # langgraph, langgraph-checkpoint-sqlite, openai, ddgs, langsmith
 ├── state.py                # ArticleState：节点间共享的状态定义
 ├── llm.py                  # DeepSeek 调用封装 call_llm() / chat()（@traceable 上报 LangSmith）
-├── prompts.py              # 各 Agent 的中文 system prompt（含 REVIEWER_PROMPT 素材审查）
+├── prompts.py              # 各 Agent 的中文 system prompt（含 MATERIAL_REVIEW_PROMPT 素材审查）
 ├── logging_config.py       # 统一日志：stderr 简洁 + 文件详细，--verbose 控制级别
 ├── langsmith_config.py     # LangSmith 配置：校验环境变量、读取 .env
 ├── .env.example            # 环境变量模板（复制为 .env 填写 Key）
@@ -64,8 +65,9 @@ blog_writer/
 │   ├── tools.py            # web_search 联网搜索工具（DuckDuckGo，region=cn-zh + 标题清洗）
 │   ├── outliner.py         # 大纲子智能体（自包含子图：搜索→审查→生成→自检→补搜/重试→兜底）
 │   ├── human_review.py     # 人工介入节点：interrupt() 暂停 + Command(resume) 续跑（--human-review）
-│   ├── writer.py           # 拆章 split / 并行写章节 write_section / 合并 merge
-│   └── editor.py           # 审校/润色节点（JSON 结构化输出，含问题章节）
+│   ├── writer.py           # 拆章 split / Send 分发 fan_out / 合并 merge（不含写作 LLM）
+│   ├── section_writer.py   # 章节写作子智能体（自包含子图：初稿 → 自检 → 条件重写）
+│   └── editor.py           # 审校/润色节点（JSON 结构化输出，含问题章节；解析失败重试）
 ├── graph.py                # LangGraph 编排：大纲 →（人工确认）→ 拆章 → 并行写 → 合并 → 审校（含打回循环）
 └── main.py                 # CLI 入口（交互循环 + --resume 断点续跑 + checkpointer 装配）
 ```
@@ -181,7 +183,7 @@ python main.py "题目" --human-review --in-memory   # 对比：进程内 checkp
    | `quality_score` | 审校节点 | 质量分（0-100） |
    | `passed` | 审校节点 | 是否通过质量检查 |
    | `revision_count` | 审校节点 | 已审校次数（控制循环上限） |
-   | `review_feedback` | 人工介入节点 | 人工修改意见；有值时回 `human_review` 先重写大纲再二次确认 |
+   | `outline_review_feedback` | 人工介入节点 | 人工修改意见；有值时回 `human_review` 先重写大纲再二次确认 |
 
 2. **编排（`graph.py`）**：用 `StateGraph` 串联节点，审校后通过条件边 `should_continue` 决定结束还是打回重写。
 
@@ -208,14 +210,14 @@ python main.py "题目" --human-review --in-memory   # 对比：进程内 checkp
 
 3. **大纲子智能体（`agents/outliner.py`）**：一个编译好的**自包含子图**，挂到主图的 `outline` 节点，负责"检索 + 生成提纲"一体：
    - **搜索**：把对话交给模型（带 `web_search` 工具），模型一次提出 3-5 个具体查询，用 `ThreadPoolExecutor` **并发**执行搜索（上限 4）；
-   - **审查**：用 `REVIEWER_PROMPT` 让 LLM 逐条审查搜索结果，剔除营销味、宽泛无信息、与主题无关、明显拼接的脏数据，整理出可靠素材；
+   - **审查**：用 `MATERIAL_REVIEW_PROMPT` 让 LLM 逐条审查搜索结果，剔除营销味、宽泛无信息、与主题无关、明显拼接的脏数据，整理出可靠素材；
    - **生成 + 自检**：基于素材生成提纲并自检（非空且不低于最低长度）；
    - **失败分类路由**：素材不足（搜索失败/审查太差）→ 补搜（≤2 轮）；提纲不合格 → 换提示重试（≤2 次）；都到上限 → 基于自身知识兜底。**保证最终一定返回可用的 outline**。
    - 补搜 / 重试计数（`search_round` / `outline_attempt`）都是子图私有键，不会泄漏回主图 state（对 langgraph 1.2.11 实测验证）。
 
-4. **写作（`agents/writer.py`）**：先用 `split` 把提纲拆成 5-7 个结构化章节，再用 `Send` API **并行**写各章节（`write_section`），最后按序合并（`merge`）；打回只重写 `failed_sections` 里的问题章节（其余章节草稿保留），并把**该章节专属的审校意见**分别交给对应的重写章节，互不串味。
+4. **写作（`agents/writer.py` + `agents/section_writer.py`）**：`writer.py` 先用 `split` 把提纲拆成 5-7 个结构化章节，再用 `Send` API **并行**触发 `write_section`；每个 `write_section` 实例是 `section_writer.py` 的**自包含子图**——初稿 → 启发式自检（篇幅 / 标题 / 要点覆盖，不调 LLM）→ 不合格且未到上限则**条件重写**（自检意见塞回生成提示），合格直接结束。最后按序合并（`merge`）；打回只重写 `failed_sections` 里的问题章节（其余章节草稿保留），并把**该章节专属的审校意见**分别交给对应的重写章节，互不串味。
 
-5. **审校（`agents/editor.py`）**：用 `json_mode=True` 让模型输出 JSON（分数/是否合格/意见/润色全文），解析后写入多个状态字段；润色时保持 Markdown 标题结构；解析失败时保守按通过处理，避免卡死循环。
+5. **审校（`agents/editor.py`）**：用 `json_mode=True` 让模型输出 JSON（分数/是否合格/意见/润色全文），解析后写入多个状态字段；润色时保持 Markdown 标题结构；**解析失败自动重试**（最多 2 次，提示附"不是合法 JSON"），重试耗尽才保守按通过处理，避免卡死循环。
 
 6. **LLM 调用（`llm.py`）**：通过 OpenAI 兼容端点访问 DeepSeek；`call_llm()` 用于一次性问答（可选 JSON 模式），`chat()` 保留完整响应以便读取 `tool_calls`。两个函数都用 `@traceable` 装饰，LangSmith 启用时每次 LLM 调用会上报为独立的 run，便于在追踪面板查看。
 
@@ -224,12 +226,18 @@ python main.py "题目" --human-review --in-memory   # 对比：进程内 checkp
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
 
+### v2.1 — 写作/审校升级为真正 Agent：章节子智能体 + 审校重试
+
+- **`write_section` 升级为自包含子智能体**（新增 `agents/section_writer.py`）：每个章节独立完成"初稿 → 自检 → 条件重写"。自检用**启发式**（篇幅 ≥ 120 字 / 以 `## ` 开头 / 覆盖要点），不调 LLM、确定性可测——**合格直接通过，省掉旧版"无条件自我反思一轮"的调用**；不合格且未到上限才重写（自检意见作为反馈塞回生成提示），达上限接受当前结果。
+- **审校解析失败重试**：`editor_node` 的 JSON 解析从"失败即保守通过"改为"**重试最多 2 次**（提示附'不是合法 JSON'），耗尽才保守通过"；`revision_count` 不因重试多计。
+- **踩过的坑（langgraph 1.2.11）**：Send 并行触发编译子图时，子图若把输入键（如 `topic`）原样写回父图会抛 `INVALID_CONCURRENT_GRAPH_UPDATE`——用 `output_schema` 限定子图只输出 `section_drafts` 根除；子图内部草稿键绝不能命名 `draft`（会覆盖父图合并结果），一律用 `section_text`。
+
 ### v2.0 — 正统 Human-in-the-Loop：interrupt + checkpoint 断点续跑
 
 - **从同步 `input()` 升级为 LangGraph 正统 HITL**：`agents/human_review.py` 改用 `interrupt()` 暂停图、`Command(resume=...)` 续跑；交互逻辑（回车确认 / 意见重写 / `#` 粘贴大纲 / `q` 退出）移到 `main.py` 的统一 invoke 循环，提示仍走 stderr。
 - **checkpoint 持久化**：默认 `SqliteSaver` 写 `.checkpoints/blog_writer.db`（`--in-memory` 可选 `MemorySaver` 对比学习）；每次运行生成 `thread_id` 作寻址单位。
 - **断点续跑 `--resume <thread_id>`**：长文写作中途（`q` 退出 / Ctrl+C / 断电）后，用同一 thread_id 从上次中断点接着写，已生成的大纲/素材/章节草稿不丢失。
-- **多轮修改自环**：输入修改意见后经 `route_review` 条件边回 `human_review` 节点，先按意见重写大纲、再二次确认（`review_feedback` 状态字段驱动）。
+- **多轮修改自环**：输入修改意见后经 `route_review` 条件边回 `human_review` 节点，先按意见重写大纲、再二次确认（`outline_review_feedback` 状态字段驱动）。
 - **踩过的坑**：`SqliteSaver.from_conn_string()` 返回 context manager，必须 `with` 解包取实例再传 `compile(checkpointer=...)`；`interrupt()` 无 checkpointer 时可暂停但状态不持久化、不可跨进程 resume。
 
 ### v1.9 — 可选人工介入（Human-in-the-Loop）：大纲确认环节
@@ -275,7 +283,7 @@ python main.py "题目" --human-review --in-memory   # 对比：进程内 checkp
 
 ### v1.1 — 调研质量优化（搜索 → 审查 → 提纲）
 
-- **检索内容 LLM 审查**（新增 `REVIEWER_PROMPT`）：搜索结果先由 LLM 逐条评估来源可信度、信息含量、相关度，剔除营销味（"一篇就够了""全面爆发"）、宽泛无信息、拼接脏数据，再基于可靠素材生成提纲。解决"搜索内容质量不高、过于宽泛"的问题。
+- **检索内容 LLM 审查**（新增 `MATERIAL_REVIEW_PROMPT`）：搜索结果先由 LLM 逐条评估来源可信度、信息含量、相关度，剔除营销味（"一篇就够了""全面爆发"）、宽泛无信息、拼接脏数据，再基于可靠素材生成提纲。解决"搜索内容质量不高、过于宽泛"的问题。
 - **科普定位**：写作端要求生活化类比、术语先解释、通俗但有深度；调研端要求"主题 + 具体方面"的聚焦查询词，不再是宽泛的单一主题词。
 - **搜索质量**：`web_search` 指定 `region=cn-zh`（中文权威源更靠前），新增 `_clean_title()` 清洗 DuckDuckGo 偶发的多站点标题拼接。
 - **Markdown 输出**：写作端必须输出标准 Markdown（一级标题 + `##` 小节），审校润色时保持标题结构，成品可直接渲染。
