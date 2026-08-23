@@ -24,6 +24,9 @@ python main.py "题目" --verbose --log-file /tmp/bw.log
 # 用虚拟环境
 .venv/bin/python main.py "题目"
 
+# 人工介入：大纲生成后暂停，确认/修改后再继续（默认全自动）
+python main.py "题目" --human-review
+
 # 确定性控制流测试（mock chat/web_search，不耗 token）
 .venv/bin/python /Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py
 ```
@@ -31,9 +34,10 @@ python main.py "题目" --verbose --log-file /tmp/bw.log
 ## 架构与数据流
 
 ```
-主图（graph.py）：START → outline(子图) → split → fan_out ─Send×N─→ write_section → merge → edit
+主图（graph.py）：START → outline(子图) → [human_review?] → split → fan_out ─Send×N─→ write_section → merge → edit
                                                                     ↑                        │
                                                     rewrite（只重写问题章节）←（should_continue）┘
+  · human_review（可选，--human-review 开关经条件边启用）：大纲后暂停，人工确认/修改大纲后再走 split；默认关闭完全不执行
   · split：LLM 把 outline 文本拆成 [{title, points, materials}]（revision_count>0 时复用，不重复调 LLM）
   · fan_out（split 的条件边）：返回 [Send("write_section", ...)×N]；打回时只 Send failed_sections 里的章节
   · write_section：并行写单章，返回 {"section_drafts": {id: text}}（reducer {**a,**b} 聚合，重写覆盖同 id）
@@ -55,11 +59,12 @@ outline 子图（agents/outliner.py，自包含）：
 | `graph.py` | 主图编排：`outline → split → write_section×N → merge → edit`，`should_continue` 决定打回重写（只重写问题章节） |
 | `state.py` | `ArticleState`（TypedDict）：主图共享状态，**不含 materials**（素材只在子图内部流动）；`section_drafts` 用 `Annotated[dict, reducer]` 聚合并行章节草稿 |
 | `llm.py` | DeepSeek 调用封装：`call_llm()`（一次性问答，可选 JSON 模式）/ `chat()`（返回完整响应以便读 `tool_calls`），均 `@traceable` 上报 LangSmith |
-| `prompts.py` | 各 Agent 中文 system prompt：RESEARCHER / REVIEWER / OUTLINER / FALLBACK_OUTLINE / SPLIT / WRITE_SECTION / EDITOR |
+| `prompts.py` | 各 Agent 中文 system prompt：RESEARCHER / REVIEWER / OUTLINER / FALLBACK_OUTLINE / REVISE_OUTLINE / SPLIT / WRITE_SECTION / EDITOR |
 | `agents/tools.py` | `web_search()` + `WEB_SEARCH_TOOL`（OpenAI 兼容 function schema） |
 | `agents/outliner.py` | **大纲子智能体**：自包含子图（搜索→审查→生成→自检→补搜/重试/兜底）；搜索多查询 ThreadPool 并行 |
 | `agents/writer.py` | `split_sections`（拆章，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `write_section`（并行写单章）/ `merge_sections`（按序拼装） |
 | `agents/editor.py` | 审校节点：`json_mode=True` 输出 JSON（score/passed/revised_article/**failed_sections**[{id,feedback}]） |
+| `agents/human_review.py` | **人工介入节点**：大纲后暂停，回车确认/输入意见重写（REVISE_OUTLINE_PROMPT）/`#` 粘贴新大纲/`q` 退出；`build_graph(enable_human_review=True)` 经条件边启用 |
 | `langsmith_config.py` | LangSmith 配置：读 `.env`、校验环境变量、设置项目名 |
 | `logging_config.py` | 统一日志：所有模块用 `logging` 替代 print；stderr 简洁输出（保留 emoji 观感）+ 文件（默认 `b_writer.log`）详细追踪；`--verbose` 控制终端级别；`setup_logging()` 幂等 |
 
@@ -88,11 +93,14 @@ outline 子图（agents/outliner.py，自包含）：
 
 9. **`get_graph()` 静态渲染不展开 Send 条件边**：编译后的图 `get_graph().edges` 只显示静态直连边，Send fan-out 不会出现在边列表里（断言节点链/边时别依赖它）。运行时链路正确性用 `invoke` + mock LLM 验证（见 test_section_writer.py）。
 
+10. **人工介入（可选，`--human-review`）**：`outline` 后加条件边路由到 `human_review` 节点，用**同步 `input()`** 交互——不用 langgraph `interrupt()`（那需要 checkpoint 持久化 + 多轮 resume，对一次性 CLI invoke 过重，且项目无 checkpoint 配置）。开关经 `build_graph(enable_human_review)` 参数 + `functools.partial` 绑定到模块级 `route_outline`（条件边函数），关闭时节点完全不执行、图与全自动版本一致。注意 `route_outline` 引用的开关只能通过 `partial` 注入——它若直接读模块级名字会 `NameError`，若用全局变量则多图并存时互相污染。交互提示走 stderr（`print(..., file=sys.stderr)`），保持 stdout 只给成品文章。打回重写循环（split ← edit）不经过该节点，人工只确认一次。注意 `REVISE_OUTLINE_PROMPT` 不含 "json" 字样（走非 json_mode 的 `call_llm`）。
+
 ## 测试方法
 
 - **确定性控制流测试**：在模块层替换 `O.chat` / `O.web_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。
 - 参考：`/Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py`（23 项检查）。核心断言模式：场景 A（素材够，1 轮收敛，chat=3）、B（补搜，chat=5）、C（两轮失败兜底，chat=5）、D（提纲两次太短兜底）、E（重试收敛，chat=4）、F（私有键不泄漏）、G（主图节点链 + outline 节点是 `CompiledStateGraph`）、H（并行搜索 3 查询）。
 - 按章节并行写作：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_writer.py`（9 项检查）——mock 主图全部 LLM，走完整链路验证：split 调 1 次 → write_section ×N（计数加锁）→ merge 顺序正确 → 审校失败 → 打回只重写问题章节（旧草稿被覆盖、其余保留）。
+- 人工介入：`/Users/power/.claude/jobs/4cc34a38/tmp/test_human_review.py`（13 项检查）——mock `agents.human_review.input`（编程序列）与 `call_llm`，单测节点四种输入（回车/意见重写/粘贴大纲/q 退出）+ 整图开关开走通 + 开关关不触发节点。
 - **真实 e2e**：跑 `python main.py "题目" --output out.md`，检查日志出现补搜/重试提示、成品是合法 Markdown、质量分正常。注意真实搜索 + LLM 调用可能超过 5 分钟，超时后转后台即可。
 
 ## 安全注意事项

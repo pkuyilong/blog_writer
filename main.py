@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="可选：日志文件路径（默认项目根目录 b_writer.log）",
     )
+    parser.add_argument(
+        "--human-review",
+        action="store_true",
+        help="大纲生成后暂停，由人工确认/修改大纲后再继续（默认全自动）",
+    )
     return parser.parse_args()
 
 
@@ -43,7 +48,7 @@ def main() -> int:
 
     logger.info(f"题目：《{args.topic}》\n")
 
-    graph = build_graph()
+    graph = build_graph(enable_human_review=args.human_review)
     result = graph.invoke(
         {
             "topic": args.topic,

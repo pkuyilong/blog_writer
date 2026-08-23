@@ -28,6 +28,7 @@
 - 🎯 **科普定位**：写作要求生活化类比、术语先解释、通俗但有深度；内容以真实素材为准
 - ✍️ **按章节并发写作**：提纲拆成 5-7 个章节，各章节**并行**写作后按序合并成全文，生成更快
 - 🔄 审校 Agent 输出质量分（0-100），**不合格打回时只重写问题章节**、每章带专属修改意见，其余保留（最多 2 次）
+- 👀 **可选人工介入**：大纲生成后暂停，由你确认/修改提纲再继续（`--human-review`，默认全自动）
 - 🧩 审校节点使用结构化 JSON 输出，方便程序读取分数/意见与问题章节
 - 📝 输出**标准 Markdown**：一级标题 + `##` 小节，可直接渲染
 - 📊 可选接入 **LangSmith** 追踪每次 Agent 执行与 LLM 调用（`llm.py` 用 `@traceable` 上报）
@@ -36,13 +37,14 @@
 ## 工作流程
 
 ```
-题目 ──→ [大纲子智能体] ──→ 可用提纲 ──→ [拆分章节] ──→ [并行写各章节] ──→ 合并 → [审校/润色 Agent] ──→ 成品文章
-             │（自包含）                             ▲                            │
-             └─ 搜索 → 审查素材 → 生成提纲 → 自检  └（不合格只重写问题章节，最多 2 次）┘
+题目 ──→ [大纲子智能体] ──→ 可用提纲 ──→（可选人工确认）──→ [拆分章节] ──→ [并行写各章节] ──→ 合并 → [审校/润色 Agent] ──→ 成品文章
+             │（自包含）                               ▲                           │
+             └─ 搜索 → 审查素材 → 生成提纲 → 自检   └（不合格只重写问题章节，最多 2 次）┘
                   （素材不足则补搜 / 提纲不合格则重试）
 ```
 
 - **大纲子智能体**（自包含独立子图）：一次到位——① 让模型一次提出 3-5 个**具体聚焦**的查询，**并发**调用 `web_search`（DuckDuckGo，`region=cn-zh`）联网搜索；② 用 `REVIEWER_PROMPT` 让 LLM **审查搜索结果**，剔除营销味/宽泛/脏数据，整理出可靠素材；③ 基于素材生成提纲并自检（非空 + 够长）。**素材不足会自动补搜（≤2 轮），提纲不合格会换提示重试（≤2 次），仍不行用自身知识兜底**——搜索、审查、提纲三者闭环，保证返回的提纲一定可用。
+- **人工确认（可选）**：加 `--human-review` 后，大纲生成完会停下展示提纲供你确认——回车通过 / 输入修改意见重新生成 / `#` 开头粘贴自己的完整大纲 / `q` 退出；不加该参数则全自动、完全跳过。
 - **拆分章节**：把提纲拆成 5-7 个结构化章节（标题 + 要点 + 对应素材）。
 - **并行写作**：各章节**并发**扩写成 Markdown（`##` 小节），再按章节顺序合并成完整文章；被打回时结合审校意见修改。
 - **审校/润色**：检查错别字、语病，给出质量分（0-100），指出问题章节并给出**每章专属**的修改意见；润色后输出全文（保持 Markdown 标题结构）；不合格则**只打回问题章节重写**（最多 2 次），这就是图中的"条件分支 + 循环"。
@@ -116,6 +118,25 @@ python main.py "为什么越来越多的人选择远程办公"
 python main.py "为什么越来越多的人选择远程办公" --output out.md
 ```
 
+可选：大纲生成后暂停，由人工确认/修改后再继续（默认全自动、不介入）。
+
+```bash
+python main.py "为什么越来越多的人选择远程办公" --human-review
+```
+
+运行到大纲生成后会停在人工审阅提示，提供四种选择：
+
+```
+👀 人工审阅大纲（--human-review 已开启）：
+----------------------------------------
+（当前提纲）
+----------------------------------------
+  [回车]          确认大纲，继续写作
+  [输入文字]      作为修改意见，重新生成大纲
+  [# 开头的内容]  视为你粘贴的完整新大纲，直接采用
+  [q]             退出
+```
+
 运行时会依次显示各阶段提示：
 
 ```
@@ -157,12 +178,15 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 
    ```python
    graph.add_node("outline", build_outliner())             # 大纲子智能体（自包含子图）
+   graph.add_node("human_review", human_review_node)       # 可选：人工确认/修改大纲
    graph.add_node("split", split_sections)                 # 拆章
    graph.add_node("write_section", write_section)          # 写单个章节（可并行多次）
    graph.add_node("merge", merge_sections)                 # 按序合并
    graph.add_node("edit", editor_node)                     # 审校
    graph.add_edge(START, "outline")
-   graph.add_edge("outline", "split")
+   graph.add_conditional_edges("outline", route_outline,    # --human-review 开关路由
+                               {"human_review": "human_review", "split": "split"})
+   graph.add_edge("human_review", "split")                 # 人工确认后进入拆章
    graph.add_conditional_edges("split", fan_out_write)     # 返回 [Send(...)×N] 并行写各章节
    graph.add_edge("write_section", "merge")
    graph.add_edge("merge", "edit")
@@ -170,7 +194,7 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
                                {"rewrite": "split", "end": END})
    ```
 
-   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `split`（**只重写 `failed_sections` 里的问题章节**）。
+   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `split`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（人工确认/修改大纲）再到 `split`；默认关闭直接到 `split`，该节点完全不执行。
 
 3. **大纲子智能体（`agents/outliner.py`）**：一个编译好的**自包含子图**，挂到主图的 `outline` 节点，负责"检索 + 生成提纲"一体：
    - **搜索**：把对话交给模型（带 `web_search` 工具），模型一次提出 3-5 个具体查询，用 `ThreadPoolExecutor` **并发**执行搜索（上限 4）；
@@ -189,6 +213,13 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v1.9 — 可选人工介入（Human-in-the-Loop）：大纲确认环节
+
+- **新增 `--human-review` 开关**（默认关闭，全自动）：大纲生成后、拆分章节前，由人工确认/修改提纲再继续——补上自动链路里"大纲方向对不对"的盲区。
+- **介入点在大纲后**：返工杠杆最高的位置——改大纲只花 30 秒，省掉后面所有并行写作与审校打回的浪费。
+- **交互方式**：`agents/human_review.py` 用同步 `input()`——回车确认 / 输入修改意见交 LLM 重写（`REVISE_OUTLINE_PROMPT`）/ `#` 开头粘贴完整新大纲 / `q` 退出；交互提示走 stderr，stdout 仍只留给成品文章。
+- **实现**：开关经 `build_graph(enable_human_review=...)` 参数 + `outline` 后条件边 `route_outline` 路由；关闭时 `human_review` 节点完全不执行；打回重写循环不经过该节点，人工只确认一次。
 
 ### v1.8 — 日志系统化：logging 替代 print
 
@@ -243,19 +274,17 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 
 ### P0 — 近期
 
-- [ ] **Self-Reflection 自我反思**（已实现 v1.7）：写作章节后让模型自我审视并改进，提升初稿质量，减少外部审校打回次数。
-- [ ] **审校 JSON 解析失败重试**：当前解析失败直接保守通过（`passed=True, score=0`），应加一次简化 prompt 重试，降低"假通过"概率。
+- [x] **Self-Reflection 自我反思**（已实现 v1.7）：写作章节后让模型自我审视并改进，提升初稿质量，减少外部审校打回次数。
 - [x] **logging 替代 print**（已实现 v1.8）：新增 `logging_config.py` 统一配置，`--verbose` 控制级别，日志同时输出到 stderr 与文件（默认 `b_writer.log`）。
 
 ### P1 — 中期
 
 - [ ] **多模型路由**：`write_section` 用便宜模型（如 `deepseek-v4-flash`），`editor_node` 用更强模型（如 `deepseek-reasoner`），实现"任务难度分级路由"的成本优化。
 - [ ] **流式输出（stream mode）**：`main.py` 用 `graph.stream()` 替代 `graph.invoke()`，按节点事件逐段输出（"正在搜索…"→"正在写第一章…"），学习 LangGraph streaming API。
-- [ ] **审校结果 Pydantic 验证**：定义 `EditorOutput` model，用 `model_validate()` 替代手动 `json.loads` + `dict.get()`，校验失败时精确定位缺失字段。
 
 ### P2 — 远期
 
-- [ ] **Human-in-the-loop 中断点**：在 `merge` 后插入 `interrupt()` 节点，让用户预览草稿并选择"继续审校"/"直接输出"/"打回某章重写"，学习 LangGraph checkpoint + interrupt 机制。
+- [x] **Human-in-the-loop 中断点**（已实现 v1.9，大纲后介入）：`--human-review` 开关在**大纲后**暂停人工确认/修改（同步 `input()`，未用 `interrupt()`）。可选扩展：在 `merge` 后加第二介入点预览全文草稿，选"继续审校 / 直接输出 / 打回某章重写"，届时再学习 checkpoint + interrupt 机制。
 - [ ] **多视角审校（Judge Panel）**：3 个并行审校角色——语言编辑（语病/流畅度）、事实核查（数据/引用准确性）、结构编辑（逻辑/衔接），独立打分取多数意见。
 - [ ] **搜索素材缓存 + 知识复用**：搜索结果按 query hash 缓存到本地，过期 24h，跨文章复用，减少重复搜索。
 
