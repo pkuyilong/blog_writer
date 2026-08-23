@@ -14,6 +14,7 @@
 回父图 state（已对 langgraph 1.2.11 实测验证）。
 """
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
 from langgraph.graph import START, END, StateGraph
@@ -31,6 +32,8 @@ from agents.tools import WEB_SEARCH_TOOL, web_search
 MAX_ATTEMPTS = 2
 # 搜索轮次上限：先搜 1 轮 + 补搜 1 轮，素材仍不足则自身知识兜底
 MAX_SEARCH_ROUNDS = 2
+# 单轮内搜索查询的并发上限（DuckDuckGo 免费 API 有限流风险，不宜过大）
+MAX_PARALLEL_SEARCHES = 4
 # 提纲最低长度（字符），低于视为"不可用"，触发重试/兜底
 MIN_OUTLINE_LEN = 60
 # 素材最低长度（字符），低于视为"素材不足"，触发补搜
@@ -71,6 +74,13 @@ def _materials_ok(materials: str) -> bool:
     return not any(m in t for m in FAILURE_MARKERS)
 
 
+def _run_search(tc) -> tuple[str, str]:
+    """执行单个搜索查询，返回 (tool_call_id, 搜索结果文本)。供线程池并行调用。"""
+    query = json.loads(tc.function.arguments).get("query", "")
+    print(f"    🔍 搜索：{query}")
+    return tc.id, web_search(query)
+
+
 def search(state: OutlineState) -> dict:
     """搜索素材并审查：让模型规划查询 → 执行搜索 → 审查筛选，产出 materials。"""
     round_n = state.get("search_round", 0) + 1
@@ -102,11 +112,10 @@ def search(state: OutlineState) -> dict:
                 ],
             }
         )
-        for tc in msg.tool_calls:
-            query = json.loads(tc.function.arguments).get("query", "")
-            print(f"    🔍 搜索：{query}")
-            result = web_search(query)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+        # 并行执行全部查询；executor.map 保持输入顺序返回结果，tool_call_id 一一对应
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_SEARCHES) as ex:
+            for tc_id, content in ex.map(_run_search, msg.tool_calls):
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})
 
         # 阶段二：让模型审查搜索结果，筛选出可靠素材
         print("  🧐 审查搜索结果素材…")

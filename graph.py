@@ -2,7 +2,7 @@ from langgraph.graph import START, END, StateGraph
 
 from agents.editor import editor_node
 from agents.outliner import build_outliner
-from agents.writer import writer_node
+from agents.writer import fan_out_write, merge_sections, split_sections, write_section
 from langsmith_config import setup_langsmith
 from state import ArticleState
 
@@ -20,11 +20,15 @@ def should_continue(state: ArticleState) -> str:
 
 
 def build_graph():
-    """组装流水线：大纲子智能体 → 写作 → 审校，审校不合格时打回写作重写。
+    """组装流水线：大纲子智能体 → 拆分章节 → 并发写作 → 合并 → 审校。
 
     其中 "outline" 是一个编译好的独立子图（agents/outliner.py）：自包含地完成
     搜索素材 → 审查 → 生成提纲 → 自检，素材不足会补搜、提纲不合格会重试，
     保证一定返回可用的 outline。
+
+    写作阶段按章节并行（Send map-reduce）：split 拆章节 → fan_out 条件边
+    并行触发 write_section 多次 → merge 按序拼装成 draft。审校不合格打回时
+    fan_out 只重写 failed_sections 里的问题章节，其余章节草稿保留。
     LangGraph 会根据环境变量自动向 LangSmith 上报执行过程（见 langsmith_config.py）。
     """
     # 校验 LangSmith 配置并设置项目名（未配置时仅打印提示，不影响运行）
@@ -32,14 +36,19 @@ def build_graph():
 
     graph = StateGraph(ArticleState)
     graph.add_node("outline", build_outliner())  # 大纲子智能体（自包含子图）
-    graph.add_node("write", writer_node)
+    graph.add_node("split", split_sections)
+    graph.add_node("write_section", write_section)
+    graph.add_node("merge", merge_sections)
     graph.add_node("edit", editor_node)
+
     graph.add_edge(START, "outline")
-    graph.add_edge("outline", "write")
-    graph.add_edge("write", "edit")
+    graph.add_edge("outline", "split")
+    graph.add_conditional_edges("split", fan_out_write)  # 返回 [Send(...)] 或 "merge"
+    graph.add_edge("write_section", "merge")
+    graph.add_edge("merge", "edit")
     graph.add_conditional_edges(
         "edit",
         should_continue,
-        {"rewrite": "write", "end": END},
+        {"rewrite": "split", "end": END},
     )
     return graph.compile()

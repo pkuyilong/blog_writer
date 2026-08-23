@@ -27,9 +27,6 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-*.md
-!CLAUDE.md
-
 
 *.pyc
 

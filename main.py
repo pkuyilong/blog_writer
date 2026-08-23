@@ -29,7 +29,13 @@ def main() -> int:
 
     graph = build_graph()
     result = graph.invoke(
-        {"topic": args.topic, "revision_count": 0, "revision_feedback": ""}
+        {
+            "topic": args.topic,
+            "sections": [],
+            "section_drafts": {},
+            "failed_sections": [],
+            "revision_count": 0,
+        }
     )
 
     article = result["final_article"]
