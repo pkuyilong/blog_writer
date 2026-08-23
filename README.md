@@ -1,4 +1,4 @@
-# b_writer — 文章生成 Agent
+# blog_writer — 文章生成 Agent
 
 一个基于 **LangGraph** 的初级多 Agent 项目：给定一个题目，自动完成中文**科普文章**的创作。
 
@@ -52,7 +52,7 @@
 ## 项目结构
 
 ```
-b_writer/
+blog_writer/
 ├── requirements.txt        # langgraph, openai, ddgs, langsmith
 ├── state.py                # ArticleState：节点间共享的状态定义
 ├── llm.py                  # DeepSeek 调用封装 call_llm() / chat()（@traceable 上报 LangSmith）
@@ -78,7 +78,7 @@ b_writer/
 ## 安装
 
 ```bash
-cd b_writer
+cd blog_writer
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -101,7 +101,7 @@ export DEEPSEEK_API_KEY=sk-你的密钥
 ```bash
 export LANGCHAIN_TRACING_V2=true
 export LANGCHAIN_API_KEY=lsv2_你的Key   # 在 https://smith.langchain.com 生成
-export LANGCHAIN_PROJECT=b_writer
+export LANGCHAIN_PROJECT=blog_writer
 ```
 
 未配置时程序正常运行、不做追踪。详细说明见 `LANGSMITH.md`。
@@ -224,7 +224,7 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
 ### v1.8 — 日志系统化：logging 替代 print
 
 - **新增 `logging_config.py`**：各模块的进度/告警输出从 `print` 改为标准 `logging`（`logger.info` / `logger.warning`），统一管理级别、格式与输出目标；成品文章仍用 `print` 输出到 stdout。
-- **终端简洁 + 文件详细追踪**：日志固定走 stderr、stdout 留给成品文章（`python main.py "题目" > out.md` 重定向时日志不会混进产物）；文件默认写项目根目录 `b_writer.log`（已 `.gitignore`），带时间戳/级别/模块名、始终记录 DEBUG，便于事后排查。
+- **终端简洁 + 文件详细追踪**：日志固定走 stderr、stdout 留给成品文章（`python main.py "题目" > out.md` 重定向时日志不会混进产物）；文件默认写项目根目录 `blog_writer.log`（已 `.gitignore`），带时间戳/级别/模块名、始终记录 DEBUG，便于事后排查。
 - **`--verbose` 控制级别**：默认 INFO，`--verbose` 降到 DEBUG；可用 `--log-file <路径>` 指定日志文件位置。
 
 ### v1.7 — 写作加入自我反思（Self-Reflection）
@@ -275,7 +275,7 @@ python main.py "为什么越来越多的人选择远程办公" --human-review
 ### P0 — 近期
 
 - [x] **Self-Reflection 自我反思**（已实现 v1.7）：写作章节后让模型自我审视并改进，提升初稿质量，减少外部审校打回次数。
-- [x] **logging 替代 print**（已实现 v1.8）：新增 `logging_config.py` 统一配置，`--verbose` 控制级别，日志同时输出到 stderr 与文件（默认 `b_writer.log`）。
+- [x] **logging 替代 print**（已实现 v1.8）：新增 `logging_config.py` 统一配置，`--verbose` 控制级别，日志同时输出到 stderr 与文件（默认 `blog_writer.log`）。
 
 ### P1 — 中期
 

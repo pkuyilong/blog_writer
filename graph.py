@@ -47,7 +47,7 @@ def build_graph(enable_human_review: bool = False):
     LangGraph 会根据环境变量自动向 LangSmith 上报执行过程（见 langsmith_config.py）。
     """
     # 校验 LangSmith 配置并设置项目名（未配置时仅打印提示，不影响运行）
-    setup_langsmith(project_name="b_writer")
+    setup_langsmith(project_name="blog_writer")
 
     graph = StateGraph(ArticleState)
     graph.add_node("outline", build_outliner())  # 大纲子智能体（自包含子图）

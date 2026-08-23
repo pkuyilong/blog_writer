@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-file",
         default=None,
-        help="可选：日志文件路径（默认项目根目录 b_writer.log）",
+        help="可选：日志文件路径（默认项目根目录 blog_writer.log）",
     )
     parser.add_argument(
         "--human-review",

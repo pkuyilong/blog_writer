@@ -6,7 +6,7 @@ LangSmith 用于追踪 agent 执行过程、状态变化、token 使用情况等
 配置方式：只要设置环境变量，LangGraph 就会自动上报追踪，无需手动创建 tracer：
   - LANGCHAIN_TRACING_V2=true
   - LANGCHAIN_API_KEY=lsv2_xxx...
-  - LANGCHAIN_PROJECT=b_writer（可选，指定项目名）
+  - LANGCHAIN_PROJECT=blog_writer（可选，指定项目名）
 
 两种设置环境变量的方式任选其一：
   1. 在 shell 里 export（见 LANGSMITH.md）

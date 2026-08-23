@@ -1,10 +1,10 @@
-# CLAUDE.md — b_writer 开发说明
+# CLAUDE.md — blog_writer 开发说明
 
 给 Claude Code（以及后续开发者）看的项目说明。面向用户的文档在 [README.md](README.md)，本文件侧重**代码结构、关键决策、踩过的坑**。
 
 ## 项目概览
 
-`b_writer` 是一个基于 **LangGraph** 的中文**科普文章**生成多 Agent 项目：给定一个中文题目，自动完成 调研 → 写作 → 审校 的创作。
+`blog_writer` 是一个基于 **LangGraph** 的中文**科普文章**生成多 Agent 项目：给定一个中文题目，自动完成 调研 → 写作 → 审校 的创作。
 
 - LLM：**DeepSeek V4 Flash**（`deepseek-v4-flash`），通过 **OpenAI 兼容端点**调用（`base_url=https://api.deepseek.com`）。**不是 Anthropic API**，别按 Claude SDK 写代码。
 - 搜索：**DuckDuckGo**（`ddgs` 库，免费无需 Key），`region=cn-zh` 提升中文结果质量。
@@ -18,7 +18,7 @@
 python main.py "为什么越来越多的人选择远程办公"
 python main.py "为什么越来越多的人选择远程办公" --output out.md
 
-# 调试：输出 DEBUG 级日志，并指定日志文件（默认项目根目录 b_writer.log）
+# 调试：输出 DEBUG 级日志，并指定日志文件（默认项目根目录 blog_writer.log）
 python main.py "题目" --verbose --log-file /tmp/bw.log
 
 # 用虚拟环境
@@ -66,7 +66,7 @@ outline 子图（agents/outliner.py，自包含）：
 | `agents/editor.py` | 审校节点：`json_mode=True` 输出 JSON（score/passed/revised_article/**failed_sections**[{id,feedback}]） |
 | `agents/human_review.py` | **人工介入节点**：大纲后暂停，回车确认/输入意见重写（REVISE_OUTLINE_PROMPT）/`#` 粘贴新大纲/`q` 退出；`build_graph(enable_human_review=True)` 经条件边启用 |
 | `langsmith_config.py` | LangSmith 配置：读 `.env`、校验环境变量、设置项目名 |
-| `logging_config.py` | 统一日志：所有模块用 `logging` 替代 print；stderr 简洁输出（保留 emoji 观感）+ 文件（默认 `b_writer.log`）详细追踪；`--verbose` 控制终端级别；`setup_logging()` 幂等 |
+| `logging_config.py` | 统一日志：所有模块用 `logging` 替代 print；stderr 简洁输出（保留 emoji 观感）+ 文件（默认 `blog_writer.log`）详细追踪；`--verbose` 控制终端级别；`setup_logging()` 幂等 |
 
 ## 关键设计决策与踩过的坑（务必阅读）
 
@@ -107,4 +107,4 @@ outline 子图（agents/outliner.py，自包含）：
 
 - `.env` 含**真实 `DEEPSEEK_API_KEY`**：**绝不在任何输出里回显**，已被 `.gitignore` 忽略，永不提交。
 - `.env.example` 是模板，不得放入真实 Key。
-- 日志默认写项目根目录 `b_writer.log`（被 `*.log` 忽略），内容含文章草稿/搜索文本，**不含 API Key**；提交前先 `git status` / `git diff` 确认没有把 `.env`、密钥或日志带进 commit。
+- 日志默认写项目根目录 `blog_writer.log`（被 `*.log` 忽略），内容含文章草稿/搜索文本，**不含 API Key**；提交前先 `git status` / `git diff` 确认没有把 `.env`、密钥或日志带进 commit。
