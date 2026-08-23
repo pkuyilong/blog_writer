@@ -190,6 +190,12 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
 
+### v1.7 — 写作加入自我反思（Self-Reflection）
+
+- **每个章节写完初稿后自我审视并改进**：`write_section` 现在分两轮——先用 `WRITE_SECTION_PROMPT` 写初稿，再用新增的 `SELF_REVIEW_PROMPT` 让模型审视自己的输出（内容扎实度 / 语言自然度 / 科普效果 / 衔接流畅度），直接输出改进后的章节。
+- **提升初稿质量，减少外部审校打回次数**：自我反思环节属于 Reflexion 模式——模型先写、再自评、再改，相当于"自己先改一遍再交作业"。审校 Agent 仍作为外部质量把关存在，两道关卡互为补充。
+- **成本说明**：每章节多一次 LLM 调用（约 +1 次/章），但因章节并行写作，墙钟时间只增加一轮 LLM 调用时长（约数秒）。
+
 ### v1.6 — Section 自带 id，"章节"成为自洽对象
 
 - **`Section` 结构加 `id` 字段**（`state.py`）：章节 = `{id, title, points, materials}`。`id` 由 `split_sections` 程序补（`enumerate` 顺序编号），不依赖 LLM 输出，杜绝编号重复/缺失。
@@ -224,6 +230,28 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 - **调研收敛**：ReAct 循环改为两阶段（一次搜索 → 强制收敛出提纲），消除"搜索轮次用尽"反复搜索、浪费 token 的问题。
 - **LangSmith 集成**：新增 `langsmith_config.py`、`.env.example`、`LANGSMITH.md`；`llm.py` 用 `@traceable` 上报每次 LLM 调用，可在 smith.langchain.com 查看完整执行追踪。
 - **去 AI 味**：重写写作/审校 prompt，禁用套话与模板结构，要求长短句交错、具体数据落地。
+
+## 待办事项
+
+按优先级排列的优化方向，兼顾学习 Agent 技术与完善项目。
+
+### P0 — 近期
+
+- [ ] **Self-Reflection 自我反思**（已实现 v1.7）：写作章节后让模型自我审视并改进，提升初稿质量，减少外部审校打回次数。
+- [ ] **审校 JSON 解析失败重试**：当前解析失败直接保守通过（`passed=True, score=0`），应加一次简化 prompt 重试，降低"假通过"概率。
+- [ ] **logging 替代 print**：引入标准 `logging` 模块，支持 `--verbose` 控制级别，输出到文件，便于调试和追踪。
+
+### P1 — 中期
+
+- [ ] **多模型路由**：`write_section` 用便宜模型（如 `deepseek-v4-flash`），`editor_node` 用更强模型（如 `deepseek-reasoner`），实现"任务难度分级路由"的成本优化。
+- [ ] **流式输出（stream mode）**：`main.py` 用 `graph.stream()` 替代 `graph.invoke()`，按节点事件逐段输出（"正在搜索…"→"正在写第一章…"），学习 LangGraph streaming API。
+- [ ] **审校结果 Pydantic 验证**：定义 `EditorOutput` model，用 `model_validate()` 替代手动 `json.loads` + `dict.get()`，校验失败时精确定位缺失字段。
+
+### P2 — 远期
+
+- [ ] **Human-in-the-loop 中断点**：在 `merge` 后插入 `interrupt()` 节点，让用户预览草稿并选择"继续审校"/"直接输出"/"打回某章重写"，学习 LangGraph checkpoint + interrupt 机制。
+- [ ] **多视角审校（Judge Panel）**：3 个并行审校角色——语言编辑（语病/流畅度）、事实核查（数据/引用准确性）、结构编辑（逻辑/衔接），独立打分取多数意见。
+- [ ] **搜索素材缓存 + 知识复用**：搜索结果按 query hash 缓存到本地，过期 24h，跨文章复用，减少重复搜索。
 
 ## 学习与扩展方向
 
