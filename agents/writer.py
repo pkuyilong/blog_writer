@@ -1,10 +1,13 @@
 import json
+import logging
 
 from langgraph.types import Send
 
 from llm import call_llm
 from prompts import SELF_REVIEW_PROMPT, SPLIT_PROMPT, WRITE_SECTION_PROMPT
 from state import ArticleState
+
+logger = logging.getLogger(__name__)
 
 
 def split_sections(state: ArticleState) -> dict:
@@ -13,9 +16,9 @@ def split_sections(state: ArticleState) -> dict:
     打回重写时（revision_count > 0 且已有 sections）直接复用，不重复调 LLM。
     """
     if state.get("revision_count", 0) > 0 and state.get("sections"):
-        print("→ 复用已拆分的章节…")
+        logger.info("→ 复用已拆分的章节…")
         return {}
-    print("→ 拆分章节…")
+    logger.info("→ 拆分章节…")
     raw = call_llm(
         SPLIT_PROMPT,
         f"文章题目：{state['topic']}\n\n【提纲】\n{state['outline']}",
@@ -27,11 +30,11 @@ def split_sections(state: ArticleState) -> dict:
         sections = []
     if not sections:
         # 兜底：拆章失败时至少给一个章节，避免并发分支为空
-        print("  ⚠ 章节拆分失败，回退为单章节")
+        logger.warning("  ⚠ 章节拆分失败，回退为单章节")
         sections = [{"title": state["topic"], "points": [], "materials": []}]
     # 给每个章节补 id（enumerate 顺序编号）：section_drafts 以它作 key，打回时按 id 匹配
     sections = [dict(s, id=i) for i, s in enumerate(sections)]
-    print(f"  📑 已拆分为 {len(sections)} 个章节")
+    logger.info(f"  📑 已拆分为 {len(sections)} 个章节")
     return {"sections": sections}
 
 
@@ -60,7 +63,7 @@ def fan_out_write(state: ArticleState):
                 targets.append(sec)
         if not targets:
             return "merge"
-        print(f"  🔁 只重写问题章节：{[sec['id'] for sec in targets]}")
+        logger.info(f"  🔁 只重写问题章节：{[sec['id'] for sec in targets]}")
     else:
         feedback_map = {}
         targets = sections
@@ -92,7 +95,7 @@ def write_section(state: dict) -> dict:
     """
     section = state["section"]
     sid = section["id"]
-    print(f"→ 写作章节[{sid}]：{section['title']}…")
+    logger.info(f"→ 写作章节[{sid}]：{section['title']}…")
     user_content = (
         f"文章主题：{state.get('topic', '')}\n\n"
         f"【本章节】标题：{section['title']}\n"
@@ -107,7 +110,7 @@ def write_section(state: dict) -> dict:
     text = call_llm(WRITE_SECTION_PROMPT, user_content)
 
     # 第二轮：自我反思改进（审视自己刚写的章节 → 输出改进版）
-    print(f"  🔍 自我反思章节[{sid}]…")
+    logger.info(f"  🔍 自我反思章节[{sid}]…")
     review_input = (
         f"文章主题：{state.get('topic', '')}\n\n"
         f"【本章节】标题：{section['title']}\n"
@@ -130,5 +133,5 @@ def merge_sections(state: ArticleState) -> dict:
             text = f"## {sec.get('title', '')}\n\n（本章未生成）"
         parts.append(text)
     draft = "\n\n".join(parts).strip()
-    print("→ 合并章节完成")
+    logger.info("→ 合并章节完成")
     return {"draft": draft}

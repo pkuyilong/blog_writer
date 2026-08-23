@@ -18,6 +18,9 @@
 python main.py "为什么越来越多的人选择远程办公"
 python main.py "为什么越来越多的人选择远程办公" --output out.md
 
+# 调试：输出 DEBUG 级日志，并指定日志文件（默认项目根目录 b_writer.log）
+python main.py "题目" --verbose --log-file /tmp/bw.log
+
 # 用虚拟环境
 .venv/bin/python main.py "题目"
 
@@ -58,6 +61,7 @@ outline 子图（agents/outliner.py，自包含）：
 | `agents/writer.py` | `split_sections`（拆章，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `write_section`（并行写单章）/ `merge_sections`（按序拼装） |
 | `agents/editor.py` | 审校节点：`json_mode=True` 输出 JSON（score/passed/revised_article/**failed_sections**[{id,feedback}]） |
 | `langsmith_config.py` | LangSmith 配置：读 `.env`、校验环境变量、设置项目名 |
+| `logging_config.py` | 统一日志：所有模块用 `logging` 替代 print；stderr 简洁输出（保留 emoji 观感）+ 文件（默认 `b_writer.log`）详细追踪；`--verbose` 控制终端级别；`setup_logging()` 幂等 |
 
 ## 关键设计决策与踩过的坑（务必阅读）
 
@@ -95,4 +99,4 @@ outline 子图（agents/outliner.py，自包含）：
 
 - `.env` 含**真实 `DEEPSEEK_API_KEY`**：**绝不在任何输出里回显**，已被 `.gitignore` 忽略，永不提交。
 - `.env.example` 是模板，不得放入真实 Key。
-- 提交前先 `git status` / `git diff` 确认没有把 `.env` 或密钥带进 commit。
+- 日志默认写项目根目录 `b_writer.log`（被 `*.log` 忽略），内容含文章草稿/搜索文本，**不含 API Key**；提交前先 `git status` / `git diff` 确认没有把 `.env`、密钥或日志带进 commit。

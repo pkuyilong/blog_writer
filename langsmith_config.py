@@ -16,8 +16,11 @@ LangSmith 用于追踪 agent 执行过程、状态变化、token 使用情况等
 不配置时不会产生任何追踪开销。
 """
 
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _load_env_file() -> None:
@@ -58,17 +61,17 @@ def setup_langsmith(project_name: str | None = None) -> None:
         os.environ["LANGCHAIN_PROJECT"] = project_name
 
     if not tracing:
-        print("⚠ LangSmith 未启用：请设置 LANGCHAIN_TRACING_V2=true")
-        print("   最简单的方式：复制 .env.example 为 .env 并填写（详见 LANGSMITH.md）")
+        logger.warning("⚠ LangSmith 未启用：请设置 LANGCHAIN_TRACING_V2=true")
+        logger.warning("   最简单的方式：复制 .env.example 为 .env 并填写（详见 LANGSMITH.md）")
         return
     if not api_key:
-        print("⚠ LangSmith 未启用：请在 .env 或环境变量中设置 LANGCHAIN_API_KEY=lsv2_xxx")
-        print("   （在 https://smith.langchain.com/settings 生成 API Key）")
+        logger.warning("⚠ LangSmith 未启用：请在 .env 或环境变量中设置 LANGCHAIN_API_KEY=lsv2_xxx")
+        logger.warning("   （在 https://smith.langchain.com/settings 生成 API Key）")
         return
 
     project = os.getenv("LANGCHAIN_PROJECT", project_name or "default")
-    print(f"✓ LangSmith 追踪已启用：项目 = {project}")
-    print("  访问 https://smith.langchain.com 查看追踪数据")
+    logger.info(f"✓ LangSmith 追踪已启用：项目 = {project}")
+    logger.info("  访问 https://smith.langchain.com 查看追踪数据")
 
 
 def is_langsmith_enabled() -> bool:

@@ -14,6 +14,7 @@
 回父图 state（已对 langgraph 1.2.11 实测验证）。
 """
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
@@ -27,6 +28,8 @@ from prompts import (
     REVIEWER_PROMPT,
 )
 from agents.tools import WEB_SEARCH_TOOL, web_search
+
+logger = logging.getLogger(__name__)
 
 # 提纲重试上限：生成 1 次 + 重试 1 次，仍未达标则自身知识兜底
 MAX_ATTEMPTS = 2
@@ -77,14 +80,14 @@ def _materials_ok(materials: str) -> bool:
 def _run_search(tc) -> tuple[str, str]:
     """执行单个搜索查询，返回 (tool_call_id, 搜索结果文本)。供线程池并行调用。"""
     query = json.loads(tc.function.arguments).get("query", "")
-    print(f"    🔍 搜索：{query}")
+    logger.info(f"    🔍 搜索：{query}")
     return tc.id, web_search(query)
 
 
 def search(state: OutlineState) -> dict:
     """搜索素材并审查：让模型规划查询 → 执行搜索 → 审查筛选，产出 materials。"""
     round_n = state.get("search_round", 0) + 1
-    print(f"  🔍 大纲子智能体搜索素材（第 {round_n} 轮）…")
+    logger.info(f"  🔍 大纲子智能体搜索素材（第 {round_n} 轮）…")
     messages = [{"role": "user", "content": f"文章题目：{state['topic']}\n请开始调研。"}]
 
     # 阶段一：让模型规划搜索（一次可请求多个查询），并执行全部搜索
@@ -118,7 +121,7 @@ def search(state: OutlineState) -> dict:
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})
 
         # 阶段二：让模型审查搜索结果，筛选出可靠素材
-        print("  🧐 审查搜索结果素材…")
+        logger.info("  🧐 审查搜索结果素材…")
         reviewed = chat(
             REVIEWER_PROMPT,
             messages
@@ -154,7 +157,7 @@ def should_search_again(state: OutlineState) -> str:
 def generate(state: OutlineState) -> dict:
     """基于素材生成/重试提纲；outline_attempt 自增，重试时提示模型补全。"""
     attempt = state.get("outline_attempt", 0) + 1
-    print(f"  📋 大纲子智能体生成提纲（第 {attempt} 次）…")
+    logger.info(f"  📋 大纲子智能体生成提纲（第 {attempt} 次）…")
     user_content = f"文章题目：{state['topic']}\n\n【素材】\n{state.get('materials', '')}"
     if attempt > 1:
         user_content += (
@@ -176,7 +179,7 @@ def should_retry(state: OutlineState) -> str:
 
 def fallback(state: OutlineState) -> dict:
     """兜底：素材/提纲均不可用时，基于模型自身知识直接输出可用提纲。"""
-    print("  ⚠ 大纲子智能体基于自身知识兜底…")
+    logger.warning("  ⚠ 大纲子智能体基于自身知识兜底…")
     resp = chat(
         FALLBACK_OUTLINE_PROMPT,
         [{"role": "user", "content": f"文章题目：{state['topic']}\n请直接输出提纲。"}],

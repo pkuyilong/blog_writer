@@ -190,6 +190,12 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
 
+### v1.8 — 日志系统化：logging 替代 print
+
+- **新增 `logging_config.py`**：各模块的进度/告警输出从 `print` 改为标准 `logging`（`logger.info` / `logger.warning`），统一管理级别、格式与输出目标；成品文章仍用 `print` 输出到 stdout。
+- **终端简洁 + 文件详细追踪**：日志固定走 stderr、stdout 留给成品文章（`python main.py "题目" > out.md` 重定向时日志不会混进产物）；文件默认写项目根目录 `b_writer.log`（已 `.gitignore`），带时间戳/级别/模块名、始终记录 DEBUG，便于事后排查。
+- **`--verbose` 控制级别**：默认 INFO，`--verbose` 降到 DEBUG；可用 `--log-file <路径>` 指定日志文件位置。
+
 ### v1.7 — 写作加入自我反思（Self-Reflection）
 
 - **每个章节写完初稿后自我审视并改进**：`write_section` 现在分两轮——先用 `WRITE_SECTION_PROMPT` 写初稿，再用新增的 `SELF_REVIEW_PROMPT` 让模型审视自己的输出（内容扎实度 / 语言自然度 / 科普效果 / 衔接流畅度），直接输出改进后的章节。
@@ -239,7 +245,7 @@ python main.py "为什么越来越多的人选择远程办公" --output out.md
 
 - [ ] **Self-Reflection 自我反思**（已实现 v1.7）：写作章节后让模型自我审视并改进，提升初稿质量，减少外部审校打回次数。
 - [ ] **审校 JSON 解析失败重试**：当前解析失败直接保守通过（`passed=True, score=0`），应加一次简化 prompt 重试，降低"假通过"概率。
-- [ ] **logging 替代 print**：引入标准 `logging` 模块，支持 `--verbose` 控制级别，输出到文件，便于调试和追踪。
+- [x] **logging 替代 print**（已实现 v1.8）：新增 `logging_config.py` 统一配置，`--verbose` 控制级别，日志同时输出到 stderr 与文件（默认 `b_writer.log`）。
 
 ### P1 — 中期
 

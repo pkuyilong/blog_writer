@@ -1,3 +1,5 @@
+import logging
+
 from langgraph.graph import START, END, StateGraph
 
 from agents.editor import editor_node
@@ -5,6 +7,8 @@ from agents.outliner import build_outliner
 from agents.writer import fan_out_write, merge_sections, split_sections, write_section
 from langsmith_config import setup_langsmith
 from state import ArticleState
+
+logger = logging.getLogger(__name__)
 
 # 最多打回重写几次（超出即接受当前结果，防止死循环）
 MAX_REVISIONS = 2
@@ -14,7 +18,7 @@ def should_continue(state: ArticleState) -> str:
     """条件边：审校通过或达到次数上限 → end；否则打回写作节点重写。"""
     if state["passed"] or state.get("revision_count", 0) >= MAX_REVISIONS:
         if not state["passed"]:
-            print(f"  ⚠ 已达最大重写次数（{MAX_REVISIONS}），接受当前结果")
+            logger.warning(f"  ⚠ 已达最大重写次数（{MAX_REVISIONS}），接受当前结果")
         return "end"
     return "rewrite"
 

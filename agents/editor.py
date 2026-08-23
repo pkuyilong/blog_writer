@@ -1,8 +1,11 @@
 import json
+import logging
 
 from llm import call_llm
 from prompts import EDITOR_PROMPT
 from state import ArticleState
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_failed_sections(failed) -> list[dict]:
@@ -36,7 +39,7 @@ def editor_node(state: ArticleState) -> dict:
     failed_sections 是 [{id, feedback}]，每个问题章节自带专属修改意见，
     打回时每个章节只会看到自己的意见，互不串味。
     """
-    print("→ 审校/润色中…")
+    logger.info("→ 审校/润色中…")
     user_content = f"请审校并润色下面这篇中文文章草稿：\n\n{state['draft']}"
     raw = call_llm(EDITOR_PROMPT, user_content, json_mode=True)
 
@@ -48,7 +51,7 @@ def editor_node(state: ArticleState) -> dict:
         failed_sections = _parse_failed_sections(data.get("failed_sections", []))
     except (json.JSONDecodeError, ValueError):
         # 解析失败时保守处理：接受当前草稿，避免把流程卡进死循环
-        print("  ⚠ 审校输出解析失败，按通过处理")
+        logger.warning("  ⚠ 审校输出解析失败，按通过处理")
         revised, passed, score, failed_sections = (
             state["draft"], True, 0, []
         )
