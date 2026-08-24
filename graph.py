@@ -13,12 +13,12 @@ from state import ArticleState
 
 logger = logging.getLogger(__name__)
 
-# 最多打回重写几次（超出即接受当前结果，防止死循环）
+# 最多打回重写几次(超出即接受当前结果,防止死循环)
 MAX_REVISIONS = 2
 
 
 def should_continue(state: ArticleState) -> str:
-    """条件边：审校通过或达到次数上限 → end；否则打回写作节点重写。"""
+    """条件边:审校通过或达到次数上限 → end;否则打回写作节点重写."""
     if state["passed"] or state.get("revision_count", 0) >= MAX_REVISIONS:
         if not state["passed"]:
             logger.warning(f"  ⚠ 已达最大重写次数（{MAX_REVISIONS}），接受当前结果")
@@ -26,49 +26,49 @@ def should_continue(state: ArticleState) -> str:
     return "rewrite"
 
 
-# 大纲后的人工介入：开关开启 → human_review（确认/修改大纲）→ split；关闭 → 直接 split
+# 大纲后的人工介入:开关开启 → human_review(确认/修改大纲)→ split;关闭 → 直接 split
 def route_outline(state: ArticleState, enable: bool = False) -> str:
     return "human_review" if enable else "split"
 
 
 def route_review(state: ArticleState) -> str:
-    """条件边（human_review 后）：有修改意见（outline_review_feedback）→ 回环重写再确认；否则 → split。
+    """条件边(human_review 后):有修改意见(outline_review_feedback)→ 回环重写再确认;否则 → split.
 
-    多轮 HITL 的关键：用户输入修改意见时，human_review_node 把意见写进
-    state["outline_review_feedback"]，本边把流程引回 human_review 节点（节点开头会按
-    意见 LLM 重写大纲再 interrupt 一次）；确认后 feedback 被清空，放行 split。
+    多轮 HITL 的关键:用户输入修改意见时,human_review_node 把意见写进
+    state["outline_review_feedback"],本边把流程引回 human_review 节点(节点开头会按
+    意见 LLM 重写大纲再 interrupt 一次);确认后 feedback 被清空,放行 split.
     """
     return "human_review" if state.get("outline_review_feedback") else "split"
 
 
 def build_graph(enable_human_review: bool = False, checkpointer=None):
-    """组装流水线：大纲子智能体 →（可选人工介入）→ 拆分章节 → 并发写作 → 合并 → 审校。
+    """组装流水线:大纲子智能体 →(可选人工介入)→ 拆分章节 → 并发写作 → 合并 → 审校.
 
-    其中 "outline" 是一个编译好的独立子图（agents/outliner.py）：自包含地完成
-    搜索素材 → 审查 → 生成提纲 → 自检，素材不足会补搜、提纲不合格会重试，
-    保证一定返回可用的 outline。
+    其中 "outline" 是一个编译好的独立子图(agents/outliner.py):自包含地完成
+    搜索素材 → 审查 → 生成提纲 → 自检,素材不足会补搜,提纲不合格会重试,
+    保证一定返回可用的 outline.
 
-    enable_human_review=True 时，大纲生成后会在 human_review 节点停下，
-    由人工确认/修改大纲再继续（对应 CLI 的 --human-review 开关）；默认关闭，
-    图与全自动版本完全一致（human_review 节点不执行）。
+    enable_human_review=True 时,大纲生成后会在 human_review 节点停下,
+    由人工确认/修改大纲再继续(对应 CLI 的 --human-review 开关);默认关闭,
+    图与全自动版本完全一致(human_review 节点不执行).
 
-    写作阶段按章节并行（Send map-reduce）：split 拆章节 → fan_out 条件边并行触发
-    write_section 多次（每次是 section_writer 自包含子图：写 → 启发式自检 → 条件重写）
-    → merge 按序拼装成 draft。审校不合格打回时 fan_out 只重写 failed_sections 里的
-    问题章节，其余章节草稿保留。
-    LangGraph 会根据环境变量自动向 LangSmith 上报执行过程（见 langsmith_config.py）。
+    写作阶段按章节并行(Send map-reduce):split 拆章节 → fan_out 条件边并行触发
+    write_section 多次(每次是 section_writer 自包含子图:写 → 启发式自检 → 条件重写)
+    → merge 按序拼装成 draft.审校不合格打回时 fan_out 只重写 failed_sections 里的
+    问题章节,其余章节草稿保留.
+    LangGraph 会根据环境变量自动向 LangSmith 上报执行过程(见 langsmith_config.py).
 
-    checkpointer（MemorySaver/SqliteSaver 等）传给 compile()：它提供 checkpoint 持久化，
-    interrupt() 人工介入、--resume 断点续跑都依赖它。传 None 时图无状态（不能中断/续跑）。
+    checkpointer(MemorySaver/SqliteSaver 等)传给 compile():它提供 checkpoint 持久化,
+    interrupt() 人工介入,--resume 断点续跑都依赖它.传 None 时图无状态(不能中断/续跑).
     """
-    # 校验 LangSmith 配置并设置项目名（未配置时仅打印提示，不影响运行）
+    # 校验 LangSmith 配置并设置项目名(未配置时仅打印提示,不影响运行)
     setup_langsmith(project_name="blog_writer")
 
     graph = StateGraph(ArticleState)
-    graph.add_node("outline", build_outliner())  # 大纲子智能体（自包含子图）
-    graph.add_node("human_review", human_review_node)  # 可选：人工确认/修改大纲
+    graph.add_node("outline", build_outliner())  # 大纲子智能体(自包含子图)
+    graph.add_node("human_review", human_review_node)  # 可选:人工确认/修改大纲
     graph.add_node("split", split_sections)
-    graph.add_node("write_section", build_section_writer())  # 章节写作子智能体（自包含子图）
+    graph.add_node("write_section", build_section_writer())  # 章节写作子智能体(自包含子图)
     graph.add_node("merge", merge_sections)
     graph.add_node("edit", editor_node)
 

@@ -1,17 +1,17 @@
 """
-LangSmith 可观测性配置模块。
+LangSmith 可观测性配置模块.
 
-LangSmith 用于追踪 agent 执行过程、状态变化、token 使用情况等。
+LangSmith 用于追踪 agent 执行过程,状态变化,token 使用情况等.
 
-配置方式：只要设置环境变量，LangGraph 就会自动上报追踪，无需手动创建 tracer：
+配置方式:只要设置环境变量,LangGraph 就会自动上报追踪,无需手动创建 tracer:
   - LANGCHAIN_TRACING_V2=true
   - LANGCHAIN_API_KEY=lsv2_xxx...
-  - LANGCHAIN_PROJECT=blog_writer（可选，指定项目名）
+  - LANGCHAIN_PROJECT=blog_writer(可选,指定项目名)
 
-复制 .env.example 为 .env 并填写（本模块启动时会自动读取）
+复制 .env.example 为 .env 并填写(本模块启动时会自动读取)
 
-首次使用需去 https://smith.langchain.com 注册并获取 API Key。
-不配置时不会产生任何追踪开销。
+首次使用需去 https://smith.langchain.com 注册并获取 API Key.
+不配置时不会产生任何追踪开销.
 """
 
 import logging
@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 def _load_env_file() -> None:
-    """读取项目根目录的 .env 文件并注入环境变量（已存在的环境变量不覆盖）。
+    """读取项目根目录的 .env 文件并注入环境变量(已存在的环境变量不覆盖).
 
-    这样把 Key 写在 .env 里即可，不必每次在 shell 里手动 export。
-    .env 已被 .gitignore 忽略，不会提交泄露。
+    这样把 Key 写在 .env 里即可,不必每次在 shell 里手动 export.
+    .env 已被 .gitignore 忽略,不会提交泄露.
     """
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
@@ -38,16 +38,16 @@ def _load_env_file() -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        # 只有环境变量未设置时才从 .env 注入，避免覆盖外部配置
+        # 只有环境变量未设置时才从 .env 注入,避免覆盖外部配置
         if key and key not in os.environ:
             os.environ[key] = value
 
 
 def setup_langsmith(project_name: str | None = None) -> None:
-    """校验 LangSmith 配置并设置项目名；LangGraph 会根据环境变量自动上报。
+    """校验 LangSmith 配置并设置项目名;LangGraph 会根据环境变量自动上报.
 
     Args:
-        project_name: 项目名，会写入 LANGCHAIN_PROJECT 环境变量。
+        project_name: 项目名,会写入 LANGCHAIN_PROJECT 环境变量.
     """
     # 先尝试从项目根目录的 .env 文件加载配置
     _load_env_file()
@@ -73,7 +73,7 @@ def setup_langsmith(project_name: str | None = None) -> None:
 
 
 def is_langsmith_enabled() -> bool:
-    """检查 LangSmith 是否已启用。"""
+    """检查 LangSmith 是否已启用."""
     return (
         os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
         and os.getenv("LANGCHAIN_API_KEY") is not None

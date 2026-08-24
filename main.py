@@ -70,10 +70,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _run(args, checkpointer) -> int:
-    """装配 checkpointer 后运行完整流程：构建图 →（可选 --resume）→ 交互 invoke → 打印成品。
+    """装配 checkpointer 后运行完整流程:构建图 →(可选 --resume)→ 交互 invoke → 打印成品.
 
-    checkpointer 由 main() 提供（MemorySaver 实例，或 `with SqliteSaver.from_conn_string(...)`
-    解包出的实例）；interrupt() 人工介入与 --resume 断点续跑都依赖它（compile(checkpointer=...)）。
+    checkpointer 由 main() 提供(MemorySaver 实例,或 `with SqliteSaver.from_conn_string(...)`
+    解包出的实例);interrupt() 人工介入与 --resume 断点续跑都依赖它(compile(checkpointer=...)).
     """
     graph = build_graph(enable_human_review=args.human_review, checkpointer=checkpointer)
 
@@ -84,7 +84,7 @@ def _run(args, checkpointer) -> int:
         logger.info(f"↩ 从断点恢复：thread_id={thread_id}")
         snap = graph.get_state(config)
         logger.info(f"  快照：待执行 next={snap.next}，已存键={sorted((snap.values or {}).keys())}")
-        # 停在 interrupt 处时 invoke(None) 会重新触发该 interrupt，进入下方交互循环
+        # 停在 interrupt 处时 invoke(None) 会重新触发该 interrupt,进入下方交互循环
         initial_input = None
     else:
         logger.info(
@@ -102,8 +102,8 @@ def _run(args, checkpointer) -> int:
     result = _interactive_invoke(graph, config, initial_input, thread_id)
 
     article = result["final_article"]
-    # 成品文章是 stdout 产物（供直接查看 / 重定向保存），不走 logging；
-    # 进度/告警日志已由 logging 输出到 stderr 与日志文件，不会混入产物。
+    # 成品文章是 stdout 产物(供直接查看 / 重定向保存),不走 logging;
+    # 进度/告警日志已由 logging 输出到 stderr 与日志文件,不会混入产物.
     print("\n" + "=" * 50)
     print(f"成品文章（质量分 {result.get('quality_score', 'N/A')}/100，"
           f"审校 {result.get('revision_count', 'N/A')} 次）：")
@@ -119,10 +119,10 @@ def _run(args, checkpointer) -> int:
 
 
 def _print_outline(payload: dict) -> None:
-    """把大纲打印到 stderr（预览，不是产物）。
+    """把大纲打印到 stderr(预览,不是产物).
 
-    交互提示统一走 stderr：main.py 末尾 print 成品文章占用 stdout，
-    `> out.md` 重定向时提示不会混进产物（本项目既有约定）。
+    交互提示统一走 stderr:main.py 末尾 print 成品文章占用 stdout,
+    `> out.md` 重定向时提示不会混进产物(本项目既有约定).
     """
     print("\n👀 人工审阅大纲（--human-review 已开启）：", file=sys.stderr)
     print("----------------------------------------", file=sys.stderr)
@@ -138,7 +138,7 @@ def _print_help() -> None:
 
 
 def _resume_payload(cmd: str) -> dict:
-    """把用户一行输入翻译成 interrupt 的 resume 载荷（三种 action，与 human_review_node 约定一致）。"""
+    """把用户一行输入翻译成 interrupt 的 resume 载荷(三种 action,与 human_review_node 约定一致)."""
     cmd = cmd.strip()
     if cmd.startswith("#"):
         return {"action": "replace", "outline": cmd}
@@ -148,9 +148,9 @@ def _resume_payload(cmd: str) -> dict:
 
 
 def _interactive_invoke(graph, config, initial_input, thread_id: str) -> dict:
-    """统一 invoke 循环：遇到 __interrupt__ 就交互（回车/意见/#粘贴/q），再 Command(resume=...) 续跑。
+    """统一 invoke 循环:遇到 __interrupt__ 就交互(回车/意见/#粘贴/q),再 Command(resume=...) 续跑.
 
-    全自动路径一次到底；HITL 多轮修改时循环多次（interrupt → resume → 再次 interrupt）。
+    全自动路径一次到底;HITL 多轮修改时循环多次(interrupt → resume → 再次 interrupt).
     """
     inp = initial_input
     while True:
@@ -162,7 +162,7 @@ def _interactive_invoke(graph, config, initial_input, thread_id: str) -> dict:
         try:
             cmd = input()
         except EOFError:
-            # stdin 被关闭（如管道提前结束）：按"退出可续跑"处理，避免卡死
+            # stdin 被关闭(如管道提前结束):按"退出可续跑"处理,避免卡死
             logger.info(f"  stdin 已关闭，进程暂停。可用 --resume {thread_id} 继续")
             sys.exit(0)
         if cmd.strip().lower() in _EXIT_COMMANDS:
@@ -175,8 +175,8 @@ def main() -> int:
     args = parse_args()
     setup_logging(verbose=args.verbose, log_file=args.log_file)
 
-    # --model 覆盖全局默认模型：只查注册表、不读 env（key 在首次真实调用时懒读），
-    # 时序安全。未知名模型给出可选项后退出。
+    # --model 覆盖全局默认模型:只查注册表,不读 env(key 在首次真实调用时懒读),
+    # 时序安全.未知名模型给出可选项后退出.
     if args.model:
         from model_router import ModelRoutingError, set_default_model
 
@@ -199,7 +199,7 @@ def main() -> int:
         logger.info("使用 MemorySaver（进程内、退出即失；仅供对比学习）")
         return _run(args, MemorySaver())
 
-    # SqliteSaver.from_conn_string 返回 context manager，必须 with 解包取实例；
+    # SqliteSaver.from_conn_string 返回 context manager,必须 with 解包取实例;
     # 直接把 context manager 传给 compile(checkpointer=...) 会报 TypeError
     from langgraph.checkpoint.sqlite import SqliteSaver
 
