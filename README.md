@@ -31,6 +31,7 @@
 - 👀 **可选人工介入**：大纲生成后暂停，由你确认/修改提纲再继续（`--human-review`，默认全自动）
 - 🧩 审校节点使用结构化 JSON 输出，方便程序读取分数/意见与问题章节
 - 📝 输出**标准 Markdown**：一级标题 + `##` 小节，可直接渲染
+- 🧭 **多模型路由**：所有 LLM 调用按角色路由（research/outline/split/write/edit/revise_outline），调用失败自动 fallback 切备用模型；`--model` 可全局换模型（目前注册 DeepSeek，加第二个模型只需在 `MODEL_REGISTRY` 注册一个规格）
 - 📊 可选接入 **LangSmith** 追踪每次 Agent 执行与 LLM 调用（`llm.py` 用 `@traceable` 上报）
 - 💻 纯命令行使用，零界面依赖
 
@@ -55,7 +56,8 @@
 blog_writer/
 ├── requirements.txt        # langgraph, langgraph-checkpoint-sqlite, openai, ddgs, langsmith
 ├── state.py                # ArticleState：节点间共享的状态定义
-├── llm.py                  # DeepSeek 调用封装 call_llm() / chat()（@traceable 上报 LangSmith）
+├── llm.py                  # LLM 调用统一封装 call_llm() / chat()（消息形状 + @traceable，委托 model_router 选模型）
+├── model_router.py         # 多模型路由：ModelSpec 注册表 + role→模型链 + fallback + client 缓存
 ├── prompts.py              # 各 Agent 的中文 system prompt（含 MATERIAL_REVIEW_PROMPT 素材审查）
 ├── logging_config.py       # 统一日志：stderr 简洁 + 文件详细，--verbose 控制级别
 ├── langsmith_config.py     # LangSmith 配置：校验环境变量、读取 .env
@@ -147,6 +149,12 @@ python main.py --resume <thread_id>   # 从断点继续（带相同的 --human-r
 python main.py "题目" --human-review --in-memory   # 对比：进程内 checkpointer，退出即失
 ```
 
+可选：覆盖全局默认模型（多模型路由入口；`--model` 后跟 `MODEL_REGISTRY` 里的名字）：
+
+```bash
+python main.py "为什么越来越多的人选择远程办公" --model deepseek-v4-flash
+```
+
 运行时会依次显示各阶段提示：
 
 ```
@@ -219,12 +227,19 @@ python main.py "题目" --human-review --in-memory   # 对比：进程内 checkp
 
 5. **审校（`agents/editor.py`）**：用 `json_mode=True` 让模型输出 JSON（分数/是否合格/意见/润色全文），解析后写入多个状态字段；润色时保持 Markdown 标题结构；**解析失败自动重试**（最多 2 次，提示附"不是合法 JSON"），重试耗尽才保守按通过处理，避免卡死循环。
 
-6. **LLM 调用（`llm.py`）**：通过 OpenAI 兼容端点访问 DeepSeek；`call_llm()` 用于一次性问答（可选 JSON 模式），`chat()` 保留完整响应以便读取 `tool_calls`。两个函数都用 `@traceable` 装饰，LangSmith 启用时每次 LLM 调用会上报为独立的 run，便于在追踪面板查看。
+6. **LLM 调用（`llm.py` + `model_router.py`）**：`llm.py` 通过 OpenAI 兼容端点访问模型；`call_llm()` 用于一次性问答（可选 JSON 模式），`chat()` 保留完整响应以便读取 `tool_calls`。两个函数都用 `@traceable` 装饰。**模型选择交给 `model_router.py`**——8 个调用点各带 `role=`，按 `ROLE_MODEL_MAP` 路由到候选模型链，调用失败自动 fallback 切下一个；`--model` 可覆盖全局默认。目前只注册 DeepSeek，加第二个模型只需在注册表加一个 `ModelSpec`。
 
 
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v2.2 — 多模型路由：角色路由 + fallback 链 + `--model` 覆盖
+
+- **新增 `model_router.py`**：`ModelSpec` 注册表（默认只注册 deepseek-v4-flash）+ `ROLE_MODEL_MAP`（role → 候选模型链，`__default__` 哨兵跟随全局默认）+ `resolve_chain()`（优先级 显式 model > role 链 > 全局默认，带能力过滤）+ `call_with_fallback()`（API/传输异常自动切下一个模型）+ `get_client()`（按 provider 懒加载缓存）。
+- **8 个调用点打 `role=`**：outliner（research/outline）、split、write、edit、revise_outline——将来可让不同环节用不同模型（如更贵更准的模型审校、便宜的模型写章）。
+- **`--model <名字>` CLI**：一处覆盖全局默认模型，直观演示路由入口。
+- **兼容性**：`call_llm`/`chat` 新增 `model`/`role` 为 **keyword-only** 参数，无参调用行为不变；client 改为懒加载（模块导入不再读 env，缺 key 在首次真实调用才报友好错误）。
 
 ### v2.1 — 写作/审校升级为真正 Agent：章节子智能体 + 审校重试
 

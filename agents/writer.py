@@ -29,6 +29,7 @@ def split_sections(state: ArticleState) -> dict:
         SPLIT_PROMPT,
         f"文章题目：{state['topic']}\n\n【提纲】\n{state['outline']}",
         json_mode=True,
+        role="split",
     )
     try:
         sections = json.loads(raw).get("sections", [])

@@ -94,7 +94,7 @@ def search(state: OutlineState) -> dict:
     ]
 
     # 阶段一：让模型规划搜索（一次可请求多个查询），并执行全部搜索
-    response = chat(RESEARCHER_PROMPT, messages, tools=[WEB_SEARCH_TOOL])
+    response = chat(RESEARCHER_PROMPT, messages, tools=[WEB_SEARCH_TOOL], role="research")
     msg = response.choices[0].message
     if not msg.tool_calls:
         # 模型认为不需要搜索：直接把它给出的内容当作素材
@@ -137,6 +137,7 @@ def search(state: OutlineState) -> dict:
                 }
             ],
             tools=[],
+            role="research",
         )
         reviewed_text = reviewed.choices[0].message.content or ""
         if _materials_ok(reviewed_text):
@@ -168,7 +169,7 @@ def generate(state: OutlineState) -> dict:
     )
     if attempt > 1:
         user_content += "\n\n（上一版提纲不够完整/可用，请基于素材输出一份更完整、可直接支撑写作的提纲。）"
-    resp = chat(OUTLINER_PROMPT, [{"role": "user", "content": user_content}], tools=[])
+    resp = chat(OUTLINER_PROMPT, [{"role": "user", "content": user_content}], tools=[], role="outline")
     outline = resp.choices[0].message.content or ""
     return {"outline": outline, "outline_attempt": attempt}
 
@@ -189,6 +190,7 @@ def fallback(state: OutlineState) -> dict:
         FALLBACK_OUTLINE_PROMPT,
         [{"role": "user", "content": f"文章题目：{state['topic']}\n请直接输出提纲。"}],
         tools=[],
+        role="outline",
     )
     return {"outline": resp.choices[0].message.content or ""}
 

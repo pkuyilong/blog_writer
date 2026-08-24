@@ -69,7 +69,7 @@ def editor_node(state: ArticleState) -> dict:
     user_content = base_content
 
     for attempt in range(1, EDITOR_MAX_RETRIES + 1):
-        raw = call_llm(EDITOR_PROMPT, user_content, json_mode=True)
+        raw = call_llm(EDITOR_PROMPT, user_content, json_mode=True, role="edit")
         try:
             revised, passed, score, failed_sections = _parse_editor_output(
                 raw, state["draft"]

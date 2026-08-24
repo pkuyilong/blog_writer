@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="用 MemorySaver 代替 SqliteSaver（进程内、退出即失；仅供对比默认的跨进程持久化）",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        metavar="NAME",
+        help="覆盖全局默认模型（MODEL_REGISTRY 里的名字，如 deepseek-v4-flash）",
+    )
     return parser.parse_args()
 
 
@@ -168,6 +174,20 @@ def _interactive_invoke(graph, config, initial_input, thread_id: str) -> dict:
 def main() -> int:
     args = parse_args()
     setup_logging(verbose=args.verbose, log_file=args.log_file)
+
+    # --model 覆盖全局默认模型：只查注册表、不读 env（key 在首次真实调用时懒读），
+    # 时序安全。未知名模型给出可选项后退出。
+    if args.model:
+        from model_router import ModelRoutingError, set_default_model
+
+        try:
+            set_default_model(args.model)
+        except ModelRoutingError as e:
+            logger.error(str(e))
+            return 1
+    from model_router import get_default_model
+
+    logger.info(f"🤖 全局默认模型：{get_default_model()}")
 
     if not args.resume and not args.topic:
         logger.error('错误：需要题目（python main.py "题目"）或 --resume <thread_id>')

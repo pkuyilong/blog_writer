@@ -33,7 +33,7 @@ def _revise_outline(topic: str, outline: str, feedback: str) -> str:
         f"【当前提纲】\n{outline}\n\n"
         f"【人工修改意见】\n{feedback}"
     )
-    return call_llm(REVISE_OUTLINE_PROMPT, user_content)
+    return call_llm(REVISE_OUTLINE_PROMPT, user_content, role="revise_outline")
 
 
 def human_review_node(state: ArticleState) -> dict:
