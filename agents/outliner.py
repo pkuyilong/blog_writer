@@ -28,7 +28,8 @@ from prompts import (
     RESEARCHER_PROMPT,
     MATERIAL_REVIEW_PROMPT,
 )
-from agents.tools import WEB_SEARCH_TOOL, web_search
+from agents.tools import WEB_SEARCH_TOOL
+from search_cache import cached_search, get_cached_materials, store_materials
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +80,26 @@ def _materials_ok(materials: str) -> bool:
 
 
 def _run_search(tc) -> tuple[str, str]:
-    """执行单个搜索查询,返回 (tool_call_id, 搜索结果文本).供线程池并行调用."""
+    """执行单个搜索查询,返回 (tool_call_id, 搜索结果文本).供线程池并行调用.
+
+    走 cached_search:query 级缓存命中直接返回, 未命中真实搜索并写库(见 search_cache.py).
+    """
     query = json.loads(tc.function.arguments).get("query", "")
     logger.info(f"    🔍 搜索：{query}")
-    return tc.id, web_search(query)
+    return tc.id, cached_search(query)
 
 
 def search(state: OutlineState) -> dict:
-    """搜索素材并审查:让模型规划查询 → 执行搜索 → 审查筛选,产出 materials."""
+    """搜索素材并审查:让模型规划查询 → 执行搜索 → 审查筛选,产出 materials.
+
+    开头先查 topic 级缓存:同一题目命中则跳过整个 搜索+审查 子流程(知识复用), 直接
+    产出素材. 命中时 search_round 照常 +1(不重置为 1), 防补搜阶段命中缓存后死循环
+    (素材不足 → 补搜 → 又命中同一缓存 → 永远到不了补搜上限).
+    """
+    hit = get_cached_materials(state["topic"])
+    if hit is not None:
+        logger.info("  ⚡ 命中素材缓存, 跳过搜索+审查")
+        return {"materials": hit, "search_round": state.get("search_round", 0) + 1}
     round_n = state.get("search_round", 0) + 1
     logger.info(f"  🔍 大纲子智能体搜索素材（第 {round_n} 轮）…")
     messages = [
@@ -148,6 +161,9 @@ def search(state: OutlineState) -> dict:
                 m.get("content", "") for m in messages if m.get("role") == "tool"
             )
 
+    # 素材可用才写入 topic 缓存(不足素材不缓存, 避免下次命中坏缓存再触发补搜)
+    if _materials_ok(materials):
+        store_materials(state["topic"], materials)
     return {"materials": materials, "search_round": round_n}
 
 

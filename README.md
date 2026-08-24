@@ -32,6 +32,7 @@
 - 🧩 审校节点使用结构化 JSON 输出，方便程序读取分数/意见与问题章节
 - 📝 输出**标准 Markdown**：一级标题 + `##` 小节，可直接渲染
 - 🧭 **多模型路由**：所有 LLM 调用按角色路由（research/outline/split/write/edit/revise_outline），调用失败自动 fallback 切备用模型；`--model` 可全局换模型（目前注册 DeepSeek，加第二个模型只需在 `MODEL_REGISTRY` 注册一个规格）
+- 📦 **搜索素材缓存（知识复用）**：搜索原始结果与整题审查后素材按 7 天 TTL 存进 SQLite（`.cache/`），同一题目/相似关键词跨运行复用，跳过重复联网与重复审查；`--clear-search-cache` 可手动清空
 - 📊 可选接入 **LangSmith** 追踪每次 Agent 执行与 LLM 调用（`llm.py` 用 `@traceable` 上报）
 - 💻 纯命令行使用，零界面依赖
 
@@ -58,6 +59,7 @@ blog_writer/
 ├── state.py                # ArticleState：节点间共享的状态定义
 ├── llm.py                  # LLM 调用统一封装 call_llm() / chat()（消息形状 + @traceable，委托 model_router 选模型）
 ├── model_router.py         # 多模型路由：ModelSpec 注册表 + role→模型链 + fallback + client 缓存
+├── search_cache.py         # 两级搜索缓存：query→搜索结果 + topic→审查后素材，SQLite 跨进程复用
 ├── prompts.py              # 各 Agent 的中文 system prompt（含 MATERIAL_REVIEW_PROMPT 素材审查）
 ├── logging_config.py       # 统一日志：stderr 简洁 + 文件详细，--verbose 控制级别
 ├── langsmith_config.py     # LangSmith 配置：校验环境变量、读取 .env
@@ -155,6 +157,12 @@ python main.py "题目" --human-review --in-memory   # 对比：进程内 checkp
 python main.py "为什么越来越多的人选择远程办公" --model deepseek-v4-flash
 ```
 
+可选：清空搜索素材缓存（`.cache/`，缓存默认 7 天自动过期，此命令强制清空后退出）：
+
+```bash
+python main.py --clear-search-cache
+```
+
 运行时会依次显示各阶段提示：
 
 ```
@@ -233,6 +241,14 @@ python main.py "为什么越来越多的人选择远程办公" --model deepseek-
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v2.3 — 搜索素材缓存 + 知识复用（两级缓存）
+
+- **新增 `search_cache.py`**：SQLite（`.cache/search_cache.db`）持久化两级缓存——`search_cache` 表（query → `web_search` 原始结果，相似关键词跨题目共享）+ `topic_materials` 表（topic → 审查后素材，同一题目跳过 搜索+审查）。
+- **大纲不缓存**：它依赖 LLM 生成，缓存会让每次运行结果一模一样；只缓存"事实数据"。
+- **TTL 7 天惰性失效**：读时发现过期即删即重新搜索；`--clear-search-cache` 手动清空。
+- **单飞防抖**：同 query 并发搜索只真正请求一次，后到线程复用结果；锁只在 SQLite 读写处，不阻塞并行搜索。
+- **兼容性**：outliner 的 `_run_search` 从 `web_search` 换为 `cached_search`（`web_search` 本身保持纯函数不变）；`agents/tools.py` 无改动。
 
 ### v2.2 — 多模型路由：角色路由 + fallback 链 + `--model` 覆盖
 

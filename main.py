@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME",
         help="覆盖全局默认模型（MODEL_REGISTRY 里的名字，如 deepseek-v4-flash）",
     )
+    parser.add_argument(
+        "--clear-search-cache",
+        action="store_true",
+        help="清空搜索素材缓存（.cache/）后退出，不继续生成文章",
+    )
     return parser.parse_args()
 
 
@@ -174,6 +179,14 @@ def _interactive_invoke(graph, config, initial_input, thread_id: str) -> dict:
 def main() -> int:
     args = parse_args()
     setup_logging(verbose=args.verbose, log_file=args.log_file)
+
+    # --clear-search-cache:独立维护命令, 清空 .cache/ 两级缓存后退出, 与模型/题目无关
+    if args.clear_search_cache:
+        from search_cache import clear
+
+        n1, n2 = clear()
+        logger.info(f"🧹 已清空搜索素材缓存: query {n1} 条, topic {n2} 条")
+        return 0
 
     # --model 覆盖全局默认模型:只查注册表,不读 env(key 在首次真实调用时懒读),
     # 时序安全.未知名模型给出可选项后退出.

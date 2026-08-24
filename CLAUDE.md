@@ -8,7 +8,7 @@
 
 - LLM：**DeepSeek V4 Flash**（`deepseek-v4-flash`），通过 **OpenAI 兼容端点**调用（`base_url=https://api.deepseek.com`）。**不是 Anthropic API**，别按 Claude SDK 写代码。
 - 多模型路由（`model_router.py`）：所有 LLM 调用按**角色**（research/outline/split/write/edit/revise_outline）路由到候选模型链，调用失败自动 fallback 切下一个；`--model` 可覆盖全局默认。目前只注册 DeepSeek，加第二个模型只需在注册表加一个 `ModelSpec`（环境里已有 `DASHSCOPE_API_KEY`/Qwen 可用）。
-- 搜索：**DuckDuckGo**（`ddgs` 库，免费无需 Key），`region=cn-zh` 提升中文结果质量。
+- 搜索：**DuckDuckGo**（`ddgs` 库，免费无需 Key），`region=cn-zh` 提升中文结果质量。**两级搜索缓存**（`search_cache.py`）：query 级缓存 `web_search` 原始结果 + topic 级缓存审查后素材（SQLite `.cache/` 跨进程复用，TTL 7 天，`--clear-search-cache` 清空）。
 - 主图节点：`outline`（子图）→ `split` → `write_section`（子图，Send 并行 ×N）→ `merge` → `edit`（条件边打回只重写问题章节，最多 2 次）。
 - 搜索：outliner 子图内 **ThreadPool 并行**（`MAX_PARALLEL_SEARCHES=4`）；写作按章节 **Send 图级并行**。
 
@@ -35,7 +35,10 @@ python main.py "题目" --human-review --in-memory
 # 覆盖全局默认模型（多模型路由入口；--model 后跟 MODEL_REGISTRY 里的名字，如 deepseek-v4-flash）
 python main.py "题目" --model deepseek-v4-flash
 
-# 确定性控制流测试（mock chat/web_search，不耗 token）
+# 清空搜索素材缓存（.cache/，除 TTL 7 天自动过期外的强制清空；清空后退出）
+python main.py --clear-search-cache
+
+# 确定性控制流测试（mock chat/cached_search，不耗 token）
 .venv/bin/python /Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py
 ```
 
@@ -72,6 +75,7 @@ outline 子图（agents/outliner.py，自包含）：
 | `model_router.py` | **多模型路由**：`ModelSpec` 注册表（MODEL_REGISTRY）+ `ROLE_MODEL_MAP`（role→候选模型链，`__default__` 哨兵跟随全局默认）+ `resolve_chain()`（显式 model > role 链 > 全局默认，能力过滤）+ `call_with_fallback()`（失败切下一个模型）+ `get_client()`（按 provider 懒加载缓存）；`ModelRoutingError` |
 | `prompts.py` | 各 Agent 中文 system prompt：RESEARCHER / REVIEWER / OUTLINER / FALLBACK_OUTLINE / REVISE_OUTLINE / SPLIT / WRITE_SECTION / EDITOR |
 | `agents/tools.py` | `web_search()` + `WEB_SEARCH_TOOL`（OpenAI 兼容 function schema） |
+| `search_cache.py` | **两级搜索缓存**：`search_cache` 表（query→web_search 原始结果）+ `topic_materials` 表（topic→审查后素材），SQLite 跨进程复用；`cached_search`（query 级，单飞防并发重复搜索）/ `get_cached_materials`+`store_materials`（topic 级）/ `clear()`（供 `--clear-search-cache`）；TTL 惰性失效 |
 | `agents/outliner.py` | **大纲子智能体**：自包含子图（搜索→审查→生成→自检→补搜/重试/兜底）；搜索多查询 ThreadPool 并行 |
 | `agents/writer.py` | 程序性节点：`split_sections`（拆章，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `merge_sections`（按序拼装）；**不含写作 LLM** |
 | `agents/section_writer.py` | **章节写作子智能体**（自包含子图，挂 `write_section` 节点）：`write`（初稿/重写）→ `self_check`（启发式自检：篇幅/标题/要点）→ `should_rewrite`（条件重写，`MAX_SECTION_ATTEMPTS` 上限）→ `emit`（输出 `section_drafts`）；`output_schema` 限定子图只输出该键 |
@@ -131,15 +135,24 @@ outline 子图（agents/outliner.py，自包含）：
     - **教学取舍**：`retryable_exceptions` 默认只捕 OpenAIError、不吞代码 bug；`timeout=300s`（原 openai 默认 600s，超长调用有被切断风险，值可在 ModelSpec 按模型调）。
     - 新参数 `model`/`role` 是 keyword-only，测试 fake 的 `**kw` 可吸收；无参调用行为与旧版完全一致（走全局默认）。
 
+15. **搜索素材缓存 + 知识复用（search_cache.py）——两级缓存 + SQLite 跨进程**：outliner 每次运行同一题目都重复真实联网搜索 + LLM 审查，缓存让其跨进程复用。要点：
+    - **两级缓存**：底层 `search_cache` 表（query → `web_search` 原始结果，相似关键词跨题目共享命中）；顶层 `topic_materials` 表（topic → 审查后素材，同一题目完全跳过 搜索+审查 子流程）。**大纲不缓存**——它是 LLM 生成内容，缓存会让每次运行结果一模一样，失去练手价值；只缓存"事实数据"。
+    - **接入点**：outliner 的 `_run_search` 从 `web_search` 换成 `cached_search`（query 级）；`search` 节点开头查 `get_cached_materials(topic)` 命中直接返回，末尾 `store_materials`（**仅 `_materials_ok` 为真才写**，不足素材不缓存，避免下次命中坏缓存再触发补搜）。
+    - **命中 topic 缓存时 `search_round` 照常 +1（不重置为 1）**：若重置，素材不足 → 补搜 → 又命中同一缓存 → 永远到不了补搜上限，死循环（实现时踩坑修正）。
+    - **单飞（single-flight）防并发重复搜索**：`cached_search` 用 `_cond`（Condition）让同 key 并发的后到线程等待，第一个线程真正 `web_search` 后写库，等待线程复用结果。**锁只在 SQLite 读写处，`web_search` 始终在锁外**（保持 outliner 多查询并行不串行化）。
+    - **SQLite 线程安全**：单连接 `check_same_thread=False` + `threading.Lock`/`Condition` 保护所有读写；`PRAGMA journal_mode=WAL`；惰性 TTL 失效（读时发现过期即删即 miss，无后台清理任务）。`DB_PATH` 可覆盖（测试用临时库隔离）。
+    - **测试 mock 点变化（关键）**：outliner 不再有 `web_search` 模块属性，`_run_search` 走 `cached_search`。所有测试改 mock `O.cached_search`，并**必须同时 mock `O.get_cached_materials`（返回 None）与 `O.store_materials`（no-op）**——否则真实连 `.cache/` 库，命中真实缓存会改变 chat 调用次数（test_model_router 实测踩坑）。
+
 ## 测试方法
 
-- **确定性控制流测试**：在模块层替换 `O.chat` / `O.web_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。
+- **确定性控制流测试**：在模块层替换 `O.chat` / `O.cached_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。注意 v2.3 起还需 mock `O.get_cached_materials`/`O.store_materials`（防连真库，见决策 #15）。
 - 参考：`/Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py`（23 项检查）。核心断言模式：场景 A（素材够，1 轮收敛，chat=3）、B（补搜，chat=5）、C（两轮失败兜底，chat=5）、D（提纲两次太短兜底）、E（重试收敛，chat=4）、F（私有键不泄漏）、G（主图节点链 + outline 节点是 `CompiledStateGraph`）、H（并行搜索 3 查询）。
 - 按章节并行写作：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_writer.py`（16 项检查）——mock 主图全部 LLM，走完整链路验证：split 调 1 次 → write_section 子图 ×N（计数加锁，per-title 版本号断言、不依赖并行执行顺序）→ merge 顺序正确 → 审校失败 → 打回只重写问题章节（旧草稿被覆盖、其余保留、专属意见传递）→ 子图私有键不泄漏。
 - 章节写作子智能体：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_subagent.py`（16 项检查）——mock `agents.section_writer.call_llm`，覆盖首写合格（不触发自检重写，对比旧版无条件反思省 1 次）/ 不合格→重写收敛 / 两次不合格接受 / 审校意见传递 / 要点不做子串检查（避免误判）/ 输出 schema 只暴露 section_drafts。
 - 审校解析重试：`/Users/power/.claude/jobs/4cc34a38/tmp/test_editor_retry.py`（13 项检查）——mock `agents.editor.call_llm`，覆盖首出合法（调 1 次）/ 失败一次后成功（调 2 次、第二次 user_content 含"不是合法 JSON"）/ 连续失败到上限保守通过。
 - 人工介入：`/Users/power/.claude/jobs/4cc34a38/tmp/test_human_review.py`（21 项检查）——mock `agents.human_review.input`（编程序列）与 `call_llm`，单测节点四种输入（回车/意见重写/粘贴大纲/q 退出）+ 整图开关开走通 + 开关关不触发节点 + 跨进程断点续跑。
 - 多模型路由：`/Users/power/.claude/jobs/4cc34a38/tmp/test_model_router.py`（24 项检查）——mock `llm.get_client`（fake client）与 `llm.call_with_fallback`（spy），覆盖 role 路由解析 / `__default__` 哨兵→全局默认 / `set_default_model` 覆盖 / 能力过滤（role 链跳过 vs 显式 model 报错）/ fallback 成功与耗尽（保留 `__cause__`）/ 8 个调用点 role 正确传递 / 旧无参行为不变 / client 懒加载缓存与缺 env 报错。
+- 搜索缓存：`/Users/power/.claude/jobs/4cc34a38/tmp/test_search_cache.py`（18 项检查）——mock `search_cache.web_search`（临时库隔离，覆盖 `DB_PATH`），覆盖 query 级 miss/命中 / key 规范化（首尾空白、大小写）/ TTL 过期重新搜索 / topic 级 store→hit→过期 miss / `clear()` 清空并返回条数 / **并发单飞（8 线程同 query，真实搜索次数 == 1）** / 空 key 不缓存。
 - **真实 e2e**：跑 `python main.py "题目" --output out.md`，检查日志出现补搜/重试提示、成品是合法 Markdown、质量分正常。注意真实搜索 + LLM 调用可能超过 5 分钟，超时后转后台即可。
 
 ## 安全注意事项
