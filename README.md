@@ -336,14 +336,15 @@ python main.py --clear-search-cache
 
 ### P1 — 中期
 
-- [ ] **多模型路由**：`write_section` 用便宜模型（如 `deepseek-v4-flash`），`editor_node` 用更强模型（如 `deepseek-reasoner`），实现"任务难度分级路由"的成本优化。
-- [ ] **流式输出（stream mode）**：`main.py` 用 `graph.stream()` 替代 `graph.invoke()`，按节点事件逐段输出（"正在搜索…"→"正在写第一章…"），学习 LangGraph streaming API。
+- [x] **多模型路由**：`write_section` 用便宜模型（如 `deepseek-v4-flash`），`editor_node` 用更强模型（如 `deepseek-reasoner`），实现"任务难度分级路由"的成本优化。
 
 ### P2 — 远期
 
 - [x] **Human-in-the-loop 中断点**（已实现 v2.0，大纲后介入 + checkpoint 断点续跑）：`--human-review` 走 LangGraph 正统 `interrupt()` + `Command(resume=...)`，默认 `SqliteSaver` 落盘；`q` 退出后可用 `--resume <thread_id>` 跨进程续跑；有修改意见时经 `route_review` 自环先重写大纲再二次确认。可选扩展：在 `merge` 后加第二介入点预览全文草稿，选"继续审校 / 直接输出 / 打回某章重写"。
-- [ ] **多视角审校（Judge Panel）**：3 个并行审校角色——语言编辑（语病/流畅度）、事实核查（数据/引用准确性）、结构编辑（逻辑/衔接），独立打分取多数意见。
-- [ ] **搜索素材缓存 + 知识复用**：搜索结果按 query hash 缓存到本地，过期 24h，跨文章复用，减少重复搜索。
+- [x] **搜索素材缓存 + 知识复用**：搜索结果按 query hash 缓存到本地，过期 24h，跨文章复用，减少重复搜索。
+- [ ] **多视角审校子智能体（Judge Panel）**：3 个并行审校角色——语言编辑（语病/流畅度）、事实核查（数据/引用准确性）、结构编辑（逻辑/衔接），独立打分取多数意见。
+- [ ] **多智能体协作**
+
 
 ## License
 
