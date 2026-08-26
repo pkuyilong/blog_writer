@@ -29,8 +29,12 @@ logger = logging.getLogger(__name__)
 # (set_default_model 与注册时都有 guard 拒绝它).
 DEFAULT_MODEL = "__default__"
 
-# 全部角色(对齐 8 个 LLM 调用点的用途).给某个调用点传 role 时必须在此集合内.
-ROLES = frozenset({"research", "outline", "split", "write", "edit", "revise_outline"})
+# 全部角色(对齐 10 个 LLM 调用点的用途).给某个调用点传 role 时必须在此集合内.
+# 审校已是 3 个独立角色(语言/逻辑/事实),各自走自己的 role 链,便于将来单独配更强模型.
+ROLES = frozenset({
+    "research", "outline", "split", "write", "revise_outline",
+    "edit_lang", "edit_logic", "edit_fact",
+})
 
 
 @dataclass(frozen=True)
@@ -67,7 +71,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
 
 # 角色 → 候选模型链(第一个为主选,失败自动切下一个).
 # 默认全部指向哨兵 DEFAULT_MODEL(= 跟随全局默认模型).
-# 想让某环节用更强的模型:{"edit": ["deepseek-reasoner", DEFAULT_MODEL]}.
+# 想让某环节用更强的模型:{"edit_fact": ["deepseek-reasoner", DEFAULT_MODEL]}.
 ROLE_MODEL_MAP: dict[str, list[str]] = {role: [DEFAULT_MODEL] for role in ROLES}
 
 # 全局默认模型(可被 main.py 的 --model 或 set_default_model() 覆盖)

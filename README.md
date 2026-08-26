@@ -2,7 +2,7 @@
 
 一个基于 **LangGraph** 的初级多 Agent 项目：给定一个题目，自动完成中文**科普文章**的创作。
 
-三个 Agent（大纲子智能体（调研选题一体）→ 写作 → 审校/润色）依次协作，共享一份状态。LLM 通过 **DeepSeek V4 Flash**（`deepseek-v4-flash`，OpenAI 兼容端点）调用，调研 Agent 通过 **DuckDuckGo** 联网搜索真实资料，并对检索内容做 LLM 审查，保证素材真实可靠。
+三个 Agent（大纲子智能体（调研选题一体）→ 写作 → 审核子智能体）依次协作，共享一份状态。LLM 通过 **DeepSeek V4 Flash**（`deepseek-v4-flash`，OpenAI 兼容端点）调用，调研 Agent 通过 **DuckDuckGo** 联网搜索真实资料，并对检索内容做 LLM 审查，保证素材真实可靠。
 
 ## 目录
 
@@ -19,19 +19,19 @@
 
 ## 功能特性
 
-- 🤖 多 Agent 分工协作：大纲子智能体、写作、审校润色
+- 🤖 多 Agent 分工协作：大纲子智能体、写作、审核子智能体
 - 🧩 **大纲子智能体**（自包含独立子图）：检索、生成、保障一体——内部 搜索 → 审查素材 → 生成提纲 → 自检；素材不足会**自动补搜**、提纲不合格会重试，最终保证返回可用的提纲
 - ⚡ **并行搜索**：一轮提出 3-5 个聚焦查询，**并发**执行搜索，节省时间、覆盖更多关键词
 - 🔍 通过 `web_search` 工具（DuckDuckGo，免费无需 Key）联网搜索真实资料，素材带来源链接
 - 🧐 **检索内容审查**：搜索结果先交给 LLM 审查（来源可信度 / 信息含量 / 相关度），剔除营销味、宽泛无信息、脏数据内容，再基于可靠素材生成提纲
 - 🎯 **科普定位**：写作要求生活化类比、术语先解释、通俗但有深度；内容以真实素材为准
 - ✍️ **按章节并发写作**：提纲拆成 5-7 个章节，各章节**并行**写作后按序合并成全文，生成更快
-- 🧐 **章节写作子智能体**：每个章节独立完成"初稿 → 自检 → 条件重写"——自检看篇幅/标题/要点覆盖，合格直接通过（省 token），不合格才重写
-- 🔄 审校 Agent 输出质量分（0-100），**不合格打回时只重写问题章节**、每章带专属修改意见，其余保留（最多 2 次）
+- 🧐 **章节写作子智能体**：每个章节独立完成"初稿 → 自检 → 条件重写"——自检看篇幅/标题，合格直接通过（省 token），不合格才重写
+- 🧑‍⚖️ **审核子智能体**：3 个审校角色（语言编辑 / 逻辑结构 / 事实准确性）**各自独立打分**，多数表决（显式通过票 ≥ 2/3）判定合格；输出质量分（有效票均值），**不合格打回时只重写问题章节**、每章带专属修改意见，其余保留（最多 2 次）
 - 👀 **可选人工介入**：大纲生成后暂停，由你确认/修改提纲再继续（`--human-review`，默认全自动）
-- 🧩 审校节点使用结构化 JSON 输出，方便程序读取分数/意见与问题章节
+- 🧩 每个审校角色输出结构化 JSON，方便程序读取分数/意见与问题章节
 - 📝 输出**标准 Markdown**：一级标题 + `##` 小节，可直接渲染
-- 🧭 **多模型路由**：所有 LLM 调用按角色路由（research/outline/split/write/edit/revise_outline），调用失败自动 fallback 切备用模型；`--model` 可全局换模型（目前注册 DeepSeek，加第二个模型只需在 `MODEL_REGISTRY` 注册一个规格）
+- 🧭 **多模型路由**：所有 LLM 调用按角色路由（research/outline/split/write/edit_lang/edit_logic/edit_fact/revise_outline），调用失败自动 fallback 切备用模型；`--model` 可全局换模型（目前注册 DeepSeek，加第二个模型只需在 `MODEL_REGISTRY` 注册一个规格）
 - 📦 **搜索素材缓存（知识复用）**：搜索原始结果与整题审查后素材按 7 天 TTL 存进 SQLite（`.cache/`），同一题目/相似关键词跨运行复用，跳过重复联网与重复审查；`--clear-search-cache` 可手动清空
 - 📊 可选接入 **LangSmith** 追踪每次 Agent 执行与 LLM 调用（`llm.py` 用 `@traceable` 上报）
 - 💻 纯命令行使用，零界面依赖
@@ -39,7 +39,7 @@
 ## 工作流程
 
 ```
-题目 ──→ [大纲子智能体] ──→ 可用提纲 ──→（可选人工确认）──→ [写作子 Agent] ──→ [审校/润色 Agent] ──→ 成品文章
+题目 ──→ [大纲子智能体] ──→ 可用提纲 ──→（可选人工确认）──→ [写作子 Agent] ──→ [审核子智能体] ──→ 成品文章
              │（自包含）                                 │（自包含：拆章→并行写各章→合并）        │
              └─ 搜索 → 审查素材 → 生成提纲 → 自检        └─────（不合格只重写问题章节，最多 2 次）──────┘
                   （素材不足则补搜 / 提纲不合格则重试）
@@ -48,7 +48,7 @@
 - **大纲子智能体**（自包含独立子图）：一次到位——① 让模型一次提出 3-5 个**具体聚焦**的查询，**并发**调用 `web_search`（DuckDuckGo，`region=cn-zh`）联网搜索；② 用 `MATERIAL_REVIEW_PROMPT` 让 LLM **审查搜索结果**，剔除营销味/宽泛/脏数据，整理出可靠素材；③ 基于素材生成提纲并自检（非空 + 够长）。**素材不足会自动补搜（≤2 轮），提纲不合格会换提示重试（≤2 次），仍不行用自身知识兜底**——搜索、审查、提纲三者闭环，保证返回的提纲一定可用。
 - **人工确认（可选）**：加 `--human-review` 后，大纲生成完会停下展示提纲供你确认——回车通过 / 输入修改意见重新生成 / `#` 开头粘贴自己的完整大纲 / `q` 退出（稍后可用 `--resume` 续跑）；不加该参数则全自动、完全跳过。
 - **写作子 Agent**（自包含独立子图）：把提纲拆成 5-7 个结构化章节（标题 + 要点 + 对应素材），用 LangGraph `Send` **并行**触发各章节写作——每个章节是 `section_writer.py` **自包含子智能体**：并发扩写成 Markdown（`##` 小节）后先**自检**（篇幅 / 标题，不调 LLM），不合格且未到上限则**条件重写**（自检意见作为反馈塞回生成提示），合格才结束。所有章节写完后按 id 合并成完整文章；被审校打回时只重写问题章节并携带该章专属意见。
-- **审校/润色**：检查错别字、语病，给出质量分（0-100），指出问题章节并给出**每章专属**的修改意见；润色后输出全文（保持 Markdown 标题结构）；不合格则**只打回问题章节重写**（最多 2 次），这就是图中的"条件分支 + 循环"。
+- **审核子智能体**（自包含独立子图）：3 个审校角色——语言编辑（错别字/语病/标点/去AI腔）、逻辑结构（结构完整/逻辑衔接/离题）、事实准确性（信息错误/数据事实）——**各自独立**给分（0-100）、判定是否合格、指出问题章节并给出**每章专属**修改意见；多数表决（≥2 票通过）定整篇是否合格。单个角色解析失败重试耗尽则**弃权**（不投通过票）；全弃权才保守通过。通过时直接以当前草稿为成品（**不再润色**）；不合格则**只打回问题章节重写**（最多 2 次），这就是图中的"条件分支 + 循环"。
 
 ## 项目结构
 
@@ -70,7 +70,7 @@ blog_writer/
 │   ├── human_review.py     # 人工介入节点：interrupt() 暂停 + Command(resume) 续跑（--human-review）
 │   ├── writing.py          # 写作子 Agent（自包含子图：拆章 split / Send 分发 fan_out / 合并 merge）
 │   ├── section_writer.py   # 章节写作子智能体（自包含子图：初稿 → 自检 → 条件重写）
-│   └── editor.py           # 审校/润色节点（JSON 结构化输出，含问题章节；解析失败重试）
+│   └── review.py           # 审核子智能体（自包含子图：3 角色并行打分 + 多数表决；解析失败弃权）
 ├── graph.py                # LangGraph 编排：大纲 →（人工确认）→ 写作子 Agent → 审校（含打回循环）
 └── main.py                 # CLI 入口（交互循环 + --resume 断点续跑 + checkpointer 装配）
 ```
@@ -175,7 +175,9 @@ python main.py --clear-search-cache
   📑 已拆分为 7 个章节
 → 写作章节[0]：引言…  ×7 并行写作
 → 合并章节完成
-→ 审校/润色中…
+→ 审核子智能体审校中（3 角色并行打分）…
+    👁 语言编辑 / 逻辑结构 / 事实准确性  各自独立打分
+
 ```
 
 最后打印成品文章及质量信息，例如 `成品文章（质量分 90/100，审校 1 次）`。输出为标准 Markdown（一级标题 + `##` 小节），可直接渲染。
@@ -192,12 +194,12 @@ python main.py --clear-search-cache
    | `outline` | 大纲子智能体 | 可用的提纲 |
    | `sections` | 写作子 Agent（split） | 拆分出的章节列表（`id` + 标题 + 要点 + 素材，`id` 由程序按顺序补）；跨打回循环保留 |
    | `section_drafts` | 写作子 Agent（section_writer） | 各章节草稿（并行写入，按 id 合并，reducer 聚合）；跨打回循环保留 |
-   | `failed_sections` | 审校节点 | 打回时需重写的章节及各自修改意见 [{id, feedback}] |
+   | `failed_sections` | 审核子智能体 | 打回时需重写的章节及各自修改意见 [{id, feedback}]（各失败角色按 id 合并） |
    | `draft` | 写作子 Agent（merge） | 合并后的全文草稿 |
-   | `final_article` | 审校节点 | 润色后的文章（合格时为成品） |
-   | `quality_score` | 审校节点 | 质量分（0-100） |
-   | `passed` | 审校节点 | 是否通过质量检查 |
-   | `revision_count` | 审校节点 | 已审校次数（控制循环上限） |
+   | `final_article` | 审核子智能体 | 恒等于当前 draft（取消润色，合格时即成品） |
+   | `quality_score` | 审核子智能体 | 质量分：有效角色 score 均值（0-100） |
+   | `passed` | 审核子智能体 | 多数表决结果（显式通过票 ≥ 2/3） |
+   | `revision_count` | 审核子智能体 | 已审校次数（控制循环上限） |
    | `outline_review_feedback` | 人工介入节点 | 人工修改意见；有值时回 `human_review` 先重写大纲再二次确认 |
 
 2. **编排（`graph.py`）**：用 `StateGraph` 串联节点，审校后通过条件边 `should_continue` 决定结束还是打回重写。
@@ -206,7 +208,7 @@ python main.py --clear-search-cache
    graph.add_node("outline", build_outliner())             # 大纲子智能体（自包含子图）
    graph.add_node("human_review", human_review_node)       # 可选：人工确认/修改大纲
    graph.add_node("writing", build_writing_agent())        # 写作子 Agent（自包含子图：拆章+并行写章+合并）
-   graph.add_node("edit", editor_node)                     # 审校
+   graph.add_node("edit", build_review_agent())            # 审核子智能体（3 角色并行打分 + 多数表决）
    graph.add_edge(START, "outline")
    graph.add_conditional_edges("outline", route_outline,    # --human-review 开关路由
                                {"human_review": "human_review", "writing": "writing"})
@@ -228,14 +230,22 @@ python main.py --clear-search-cache
 
 4. **写作（`agents/writing.py` + `agents/section_writer.py`）**：`writing.py` 是**自包含子图**，内部先用 `split` 把提纲拆成 5-7 个结构化章节，再用 `Send` API **并行**触发 `write_section`；每个 `write_section` 实例是 `section_writer.py` 的**自包含子图**——初稿 → 启发式自检（篇幅 / 标题，不调 LLM）→ 不合格且未到上限则**条件重写**（自检意见塞回生成提示），合格直接结束。最后按 id 合并（`merge`）；打回只重写 `failed_sections` 里的问题章节（其余章节草稿保留），并把**该章节专属的审校意见**分别交给对应的重写章节，互不串味。`output_schema` 只把 `draft`/`sections`/`section_drafts` 写回主图（后两者是跨打回循环的共享通道）。
 
-5. **审校（`agents/editor.py`）**：用 `json_mode=True` 让模型输出 JSON（分数/是否合格/意见/润色全文），解析后写入多个状态字段；润色时保持 Markdown 标题结构；**解析失败自动重试**（最多 2 次，提示附"不是合法 JSON"），重试耗尽才保守按通过处理，避免卡死循环。
+5. **审核子智能体（`agents/review.py`）**：自包含子图，`START` 经条件边 `fan_out_reviewers` 用 `Send` **并行**触发 3 个审校角色（语言编辑 / 逻辑结构 / 事实准确性），每个角色 `json_mode=True` 独立输出 `{score, passed, failed_sections}`；并行实例只写私有 reducer 聚合键 `role_reviews`（`output_schema` 限定子图只写回 5 个父图键）。`aggregate` 屏障后做**多数表决**：显式通过票 ≥ 2（3 角色半数+1）才判合格；单个角色 JSON 解析失败重试（最多 2 次，提示附"不是合法 json"）耗尽则**弃权**（`passed=None`，不投通过票、不计入均值）——坏角色拉不偏表决；全弃权才保守通过，避免卡死循环。通过时 `final_article = draft`（**不再润色**）。
 
-6. **LLM 调用（`llm.py` + `model_router.py`）**：`llm.py` 通过 OpenAI 兼容端点访问模型；`call_llm()` 用于一次性问答（可选 JSON 模式），`chat()` 保留完整响应以便读取 `tool_calls`。两个函数都用 `@traceable` 装饰。**模型选择交给 `model_router.py`**——8 个调用点各带 `role=`，按 `ROLE_MODEL_MAP` 路由到候选模型链，调用失败自动 fallback 切下一个；`--model` 可覆盖全局默认。目前只注册 DeepSeek，加第二个模型只需在注册表加一个 `ModelSpec`。
+6. **LLM 调用（`llm.py` + `model_router.py`）**：`llm.py` 通过 OpenAI 兼容端点访问模型；`call_llm()` 用于一次性问答（可选 JSON 模式），`chat()` 保留完整响应以便读取 `tool_calls`。两个函数都用 `@traceable` 装饰。**模型选择交给 `model_router.py`**——10 个调用点各带 `role=`（审校是 3 个角色 `edit_lang`/`edit_logic`/`edit_fact` 各 1 次），按 `ROLE_MODEL_MAP` 路由到候选模型链，调用失败自动 fallback 切下一个；`--model` 可覆盖全局默认。目前只注册 DeepSeek，加第二个模型只需在注册表加一个 `ModelSpec`。
 
 
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v2.5 — 审核子智能体：3 个审校角色独立打分 + 多数表决 + 取消润色
+
+- **新增 `agents/review.py`**（删除 `agents/editor.py`）：审校从单个"文字编辑+润色"节点升级为**自包含子图**——`START` 经条件边用 `Send` **并行**触发 3 个审校角色（语言编辑 / 逻辑结构 / 事实准确性），各自 `json_mode=True` 独立输出 `{score, passed, failed_sections}`，私有 reducer 聚合键 `role_reviews` + `output_schema` 限定只写回 5 个父图键（复用 section_writer/writing 的子图范式）。
+- **多数表决 + 弃权兜底**：显式通过票 ≥ 2（3 角色半数+1）才判合格，`quality_score = 有效票 score 均值`；单个角色解析失败重试（≤2 次）耗尽则**弃权**（不投通过票、不计入均值）——坏角色带不偏表决；全弃权才保守通过（沿用"绝不卡死"语义）。
+- **取消润色**：`final_article = draft`（不再产出润色稿），省去一整次"全文重写"的 LLM 调用；问题章节的专属意见仍按 id 合并（同 id 用【角色名】前缀拼接）交给 writing 打回重写。
+- **多模型路由跟进**：`ROLES` 由 `edit` 拆为 `edit_lang`/`edit_logic`/`edit_fact`（10 个调用点），将来可单独给事实核查配更强模型。
+- **运行观测**：每轮审校打印"审核子智能体审校中（3 角色并行打分）"，质量分 / 通过判定 / 打回逻辑与旧版语义一致。
 
 ### v2.4 — 写作子 Agent：拆章 + 并行写章 + 合并封装为自包含子图
 
@@ -338,13 +348,13 @@ python main.py --clear-search-cache
 
 ### P1 — 中期
 
-- [x] **多模型路由**：`write_section` 用便宜模型（如 `deepseek-v4-flash`），`editor_node` 用更强模型（如 `deepseek-reasoner`），实现"任务难度分级路由"的成本优化。
+- [x] **多模型路由**：`write_section` 用便宜模型（如 `deepseek-v4-flash`），事实核查角色 `edit_fact` 用更强模型（如 `deepseek-reasoner`），实现"任务难度分级路由"的成本优化。
 
 ### P2 — 远期
 
 - [x] **Human-in-the-loop 中断点**（已实现 v2.0，大纲后介入 + checkpoint 断点续跑）：`--human-review` 走 LangGraph 正统 `interrupt()` + `Command(resume=...)`，默认 `SqliteSaver` 落盘；`q` 退出后可用 `--resume <thread_id>` 跨进程续跑；有修改意见时经 `route_review` 自环先重写大纲再二次确认。可选扩展：在 `merge` 后加第二介入点预览全文草稿，选"继续审校 / 直接输出 / 打回某章重写"。
 - [x] **搜索素材缓存 + 知识复用**：搜索结果按 query hash 缓存到本地，过期 24h，跨文章复用，减少重复搜索。
-- [ ] **多视角审校子智能体（Judge Panel）**：3 个并行审校角色——语言编辑（语病/流畅度）、事实核查（数据/引用准确性）、结构编辑（逻辑/衔接），独立打分取多数意见。
+- [x] **多视角审校子智能体（Judge Panel）**（已实现 v2.5）：3 个并行审校角色——语言编辑（语病/流畅度）、事实核查（数据/引用准确性）、结构编辑（逻辑/衔接），独立打分取多数意见；角色解析失败弃权、全弃权保守通过。
 - [ ] **多智能体协作**
 
 

@@ -3,9 +3,9 @@ from functools import partial
 
 from langgraph.graph import START, END, StateGraph
 
-from agents.editor import editor_node
 from agents.human_review import human_review_node
 from agents.outliner import build_outliner
+from agents.review import build_review_agent
 from agents.writing import build_writing_agent
 from langsmith_config import setup_langsmith
 from state import ArticleState
@@ -41,7 +41,7 @@ def route_review(state: ArticleState) -> str:
 
 
 def build_graph(enable_human_review: bool = False, checkpointer=None):
-    """组装流水线:大纲子智能体 →(可选人工介入)→ 写作子 Agent → 审校.
+    """组装流水线:大纲子智能体 →(可选人工介入)→ 写作子 Agent → 审核子智能体.
 
     其中 "outline" 是一个编译好的独立子图(agents/outliner.py):自包含地完成
     搜索素材 → 审查 → 生成提纲 → 自检,素材不足会补搜,提纲不合格会重试,
@@ -51,6 +51,10 @@ def build_graph(enable_human_review: bool = False, checkpointer=None):
     章节写作子智能体(agents/section_writer.py)×N → 按 id 合并,产出整篇 draft.
     审校不合格打回时主图再次进入 writing,子图内部只重写 failed_sections 里的
     问题章节,其余章节草稿保留(共享通道跨循环流动).
+
+    "edit" 是审核子智能体(agents/review.py):3 个审校角色(语言/逻辑/事实)各自独立
+    打分,多数表决(显式通过票 >= 2/3)判定是否合格,产出 final_article(=draft,取消润色)/
+    quality_score/passed/failed_sections/revision_count 写回父图.
 
     enable_human_review=True 时,大纲生成后会在 human_review 节点停下,
     由人工确认/修改大纲再继续(对应 CLI 的 --human-review 开关);默认关闭,
@@ -68,7 +72,7 @@ def build_graph(enable_human_review: bool = False, checkpointer=None):
     graph.add_node("outline", build_outliner())  # 大纲子智能体(自包含子图)
     graph.add_node("human_review", human_review_node)  # 可选:人工确认/修改大纲
     graph.add_node("writing", build_writing_agent())  # 写作子 Agent(自包含子图:拆章+并行写章+合并)
-    graph.add_node("edit", editor_node)
+    graph.add_node("edit", build_review_agent())  # 审核子智能体(自包含子图:3 角色并行打分+多数表决)
 
     graph.add_edge(START, "outline")
 
