@@ -6,8 +6,7 @@ from langgraph.graph import START, END, StateGraph
 from agents.editor import editor_node
 from agents.human_review import human_review_node
 from agents.outliner import build_outliner
-from agents.section_writer import build_section_writer
-from agents.writer import fan_out_write, merge_sections, split_sections
+from agents.writing import build_writing_agent
 from langsmith_config import setup_langsmith
 from state import ArticleState
 
@@ -26,36 +25,37 @@ def should_continue(state: ArticleState) -> str:
     return "rewrite"
 
 
-# 大纲后的人工介入:开关开启 → human_review(确认/修改大纲)→ split;关闭 → 直接 split
+# 大纲后的人工介入:开关开启 → human_review(确认/修改大纲)→ writing;关闭 → 直接 writing
 def route_outline(state: ArticleState, enable: bool = False) -> str:
-    return "human_review" if enable else "split"
+    return "human_review" if enable else "writing"
 
 
 def route_review(state: ArticleState) -> str:
-    """条件边(human_review 后):有修改意见(outline_review_feedback)→ 回环重写再确认;否则 → split.
+    """条件边(human_review 后):有修改意见(outline_review_feedback)→ 回环重写再确认;否则 → writing.
 
     多轮 HITL 的关键:用户输入修改意见时,human_review_node 把意见写进
     state["outline_review_feedback"],本边把流程引回 human_review 节点(节点开头会按
-    意见 LLM 重写大纲再 interrupt 一次);确认后 feedback 被清空,放行 split.
+    意见 LLM 重写大纲再 interrupt 一次);确认后 feedback 被清空,放行 writing.
     """
-    return "human_review" if state.get("outline_review_feedback") else "split"
+    return "human_review" if state.get("outline_review_feedback") else "writing"
 
 
 def build_graph(enable_human_review: bool = False, checkpointer=None):
-    """组装流水线:大纲子智能体 →(可选人工介入)→ 拆分章节 → 并发写作 → 合并 → 审校.
+    """组装流水线:大纲子智能体 →(可选人工介入)→ 写作子 Agent → 审校.
 
     其中 "outline" 是一个编译好的独立子图(agents/outliner.py):自包含地完成
     搜索素材 → 审查 → 生成提纲 → 自检,素材不足会补搜,提纲不合格会重试,
     保证一定返回可用的 outline.
 
+    "writing" 是写作子 Agent 子图(agents/writing.py):内部完成 拆章 → Send 并行触发
+    章节写作子智能体(agents/section_writer.py)×N → 按 id 合并,产出整篇 draft.
+    审校不合格打回时主图再次进入 writing,子图内部只重写 failed_sections 里的
+    问题章节,其余章节草稿保留(共享通道跨循环流动).
+
     enable_human_review=True 时,大纲生成后会在 human_review 节点停下,
     由人工确认/修改大纲再继续(对应 CLI 的 --human-review 开关);默认关闭,
     图与全自动版本完全一致(human_review 节点不执行).
 
-    写作阶段按章节并行(Send map-reduce):split 拆章节 → fan_out 条件边并行触发
-    write_section 多次(每次是 section_writer 自包含子图:写 → 启发式自检 → 条件重写)
-    → merge 按序拼装成 draft.审校不合格打回时 fan_out 只重写 failed_sections 里的
-    问题章节,其余章节草稿保留.
     LangGraph 会根据环境变量自动向 LangSmith 上报执行过程(见 langsmith_config.py).
 
     checkpointer(MemorySaver/SqliteSaver 等)传给 compile():它提供 checkpoint 持久化,
@@ -67,9 +67,7 @@ def build_graph(enable_human_review: bool = False, checkpointer=None):
     graph = StateGraph(ArticleState)
     graph.add_node("outline", build_outliner())  # 大纲子智能体(自包含子图)
     graph.add_node("human_review", human_review_node)  # 可选:人工确认/修改大纲
-    graph.add_node("split", split_sections)
-    graph.add_node("write_section", build_section_writer())  # 章节写作子智能体(自包含子图)
-    graph.add_node("merge", merge_sections)
+    graph.add_node("writing", build_writing_agent())  # 写作子 Agent(自包含子图:拆章+并行写章+合并)
     graph.add_node("edit", editor_node)
 
     graph.add_edge(START, "outline")
@@ -77,19 +75,17 @@ def build_graph(enable_human_review: bool = False, checkpointer=None):
     graph.add_conditional_edges(
         "outline",
         partial(route_outline, enable=enable_human_review),
-        {"human_review": "human_review", "split": "split"},
+        {"human_review": "human_review", "writing": "writing"},
     )
     graph.add_conditional_edges(
         "human_review",
         route_review,
-        {"human_review": "human_review", "split": "split"},
+        {"human_review": "human_review", "writing": "writing"},
     )
-    graph.add_conditional_edges("split", fan_out_write)  # 返回 [Send(...)] 或 "merge"
-    graph.add_edge("write_section", "merge")
-    graph.add_edge("merge", "edit")
+    graph.add_edge("writing", "edit")
     graph.add_conditional_edges(
         "edit",
         should_continue,
-        {"rewrite": "split", "end": END},
+        {"rewrite": "writing", "end": END},
     )
     return graph.compile(checkpointer=checkpointer)

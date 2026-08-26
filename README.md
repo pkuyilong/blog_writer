@@ -39,16 +39,15 @@
 ## 工作流程
 
 ```
-题目 ──→ [大纲子智能体] ──→ 可用提纲 ──→（可选人工确认）──→ [拆分章节] ──→ [并行写各章节] ──→ 合并 → [审校/润色 Agent] ──→ 成品文章
-             │（自包含）                               ▲                           │
-             └─ 搜索 → 审查素材 → 生成提纲 → 自检   └（不合格只重写问题章节，最多 2 次）┘
+题目 ──→ [大纲子智能体] ──→ 可用提纲 ──→（可选人工确认）──→ [写作子 Agent] ──→ [审校/润色 Agent] ──→ 成品文章
+             │（自包含）                                 │（自包含：拆章→并行写各章→合并）        │
+             └─ 搜索 → 审查素材 → 生成提纲 → 自检        └─────（不合格只重写问题章节，最多 2 次）──────┘
                   （素材不足则补搜 / 提纲不合格则重试）
 ```
 
 - **大纲子智能体**（自包含独立子图）：一次到位——① 让模型一次提出 3-5 个**具体聚焦**的查询，**并发**调用 `web_search`（DuckDuckGo，`region=cn-zh`）联网搜索；② 用 `MATERIAL_REVIEW_PROMPT` 让 LLM **审查搜索结果**，剔除营销味/宽泛/脏数据，整理出可靠素材；③ 基于素材生成提纲并自检（非空 + 够长）。**素材不足会自动补搜（≤2 轮），提纲不合格会换提示重试（≤2 次），仍不行用自身知识兜底**——搜索、审查、提纲三者闭环，保证返回的提纲一定可用。
 - **人工确认（可选）**：加 `--human-review` 后，大纲生成完会停下展示提纲供你确认——回车通过 / 输入修改意见重新生成 / `#` 开头粘贴自己的完整大纲 / `q` 退出（稍后可用 `--resume` 续跑）；不加该参数则全自动、完全跳过。
-- **拆分章节**：把提纲拆成 5-7 个结构化章节（标题 + 要点 + 对应素材）。
-- **并行写作（章节子智能体）**：每个章节是一个**自包含子智能体**——并发扩写成 Markdown（`##` 小节）后先**自检**（篇幅 / 标题 / 要点覆盖，不调 LLM），不合格且未到上限则**条件重写**（自检意见作为反馈塞回生成提示），合格才结束。所有章节写完后按序合并成完整文章；被审校打回时结合该章专属意见修改。
+- **写作子 Agent**（自包含独立子图）：把提纲拆成 5-7 个结构化章节（标题 + 要点 + 对应素材），用 LangGraph `Send` **并行**触发各章节写作——每个章节是 `section_writer.py` **自包含子智能体**：并发扩写成 Markdown（`##` 小节）后先**自检**（篇幅 / 标题，不调 LLM），不合格且未到上限则**条件重写**（自检意见作为反馈塞回生成提示），合格才结束。所有章节写完后按 id 合并成完整文章；被审校打回时只重写问题章节并携带该章专属意见。
 - **审校/润色**：检查错别字、语病，给出质量分（0-100），指出问题章节并给出**每章专属**的修改意见；润色后输出全文（保持 Markdown 标题结构）；不合格则**只打回问题章节重写**（最多 2 次），这就是图中的"条件分支 + 循环"。
 
 ## 项目结构
@@ -69,10 +68,10 @@ blog_writer/
 │   ├── tools.py            # web_search 联网搜索工具（DuckDuckGo，region=cn-zh + 标题清洗）
 │   ├── outliner.py         # 大纲子智能体（自包含子图：搜索→审查→生成→自检→补搜/重试→兜底）
 │   ├── human_review.py     # 人工介入节点：interrupt() 暂停 + Command(resume) 续跑（--human-review）
-│   ├── writer.py           # 拆章 split / Send 分发 fan_out / 合并 merge（不含写作 LLM）
+│   ├── writing.py          # 写作子 Agent（自包含子图：拆章 split / Send 分发 fan_out / 合并 merge）
 │   ├── section_writer.py   # 章节写作子智能体（自包含子图：初稿 → 自检 → 条件重写）
 │   └── editor.py           # 审校/润色节点（JSON 结构化输出，含问题章节；解析失败重试）
-├── graph.py                # LangGraph 编排：大纲 →（人工确认）→ 拆章 → 并行写 → 合并 → 审校（含打回循环）
+├── graph.py                # LangGraph 编排：大纲 →（人工确认）→ 写作子 Agent → 审校（含打回循环）
 └── main.py                 # CLI 入口（交互循环 + --resume 断点续跑 + checkpointer 装配）
 ```
 
@@ -191,10 +190,10 @@ python main.py --clear-search-cache
    |---|---|---|
    | `topic` | 用户（`main.py`） | 输入的题目 |
    | `outline` | 大纲子智能体 | 可用的提纲 |
-   | `sections` | 拆章节点 | 拆分出的章节列表（`id` + 标题 + 要点 + 素材，`id` 由程序按顺序补） |
-   | `section_drafts` | 写章节节点 | 各章节草稿（并行写入，按 id 合并） |
+   | `sections` | 写作子 Agent（split） | 拆分出的章节列表（`id` + 标题 + 要点 + 素材，`id` 由程序按顺序补）；跨打回循环保留 |
+   | `section_drafts` | 写作子 Agent（section_writer） | 各章节草稿（并行写入，按 id 合并，reducer 聚合）；跨打回循环保留 |
    | `failed_sections` | 审校节点 | 打回时需重写的章节及各自修改意见 [{id, feedback}] |
-   | `draft` | 合并节点 | 合并后的全文草稿 |
+   | `draft` | 写作子 Agent（merge） | 合并后的全文草稿 |
    | `final_article` | 审校节点 | 润色后的文章（合格时为成品） |
    | `quality_score` | 审校节点 | 质量分（0-100） |
    | `passed` | 审校节点 | 是否通过质量检查 |
@@ -206,23 +205,19 @@ python main.py --clear-search-cache
    ```python
    graph.add_node("outline", build_outliner())             # 大纲子智能体（自包含子图）
    graph.add_node("human_review", human_review_node)       # 可选：人工确认/修改大纲
-   graph.add_node("split", split_sections)                 # 拆章
-   graph.add_node("write_section", write_section)          # 写单个章节（可并行多次）
-   graph.add_node("merge", merge_sections)                 # 按序合并
+   graph.add_node("writing", build_writing_agent())        # 写作子 Agent（自包含子图：拆章+并行写章+合并）
    graph.add_node("edit", editor_node)                     # 审校
    graph.add_edge(START, "outline")
    graph.add_conditional_edges("outline", route_outline,    # --human-review 开关路由
-                               {"human_review": "human_review", "split": "split"})
-   graph.add_conditional_edges("human_review", route_review,  # 有意见→回 human_review 重写；无→split
-                               {"human_review": "human_review", "split": "split"})
-   graph.add_conditional_edges("split", fan_out_write)     # 返回 [Send(...)×N] 并行写各章节
-   graph.add_edge("write_section", "merge")
-   graph.add_edge("merge", "edit")
+                               {"human_review": "human_review", "writing": "writing"})
+   graph.add_conditional_edges("human_review", route_review,  # 有意见→回 human_review 重写；无→writing
+                               {"human_review": "human_review", "writing": "writing"})
+   graph.add_edge("writing", "edit")
    graph.add_conditional_edges("edit", should_continue,
-                               {"rewrite": "split", "end": END})
+                               {"rewrite": "writing", "end": END})
    ```
 
-   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `split`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（`interrupt()` 暂停展示大纲）再到 `split`；用户输入修改意见时经条件边 `route_review` 回 `human_review` 先重写大纲、再二次确认；默认关闭直接到 `split`，该节点完全不执行。
+   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `writing`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（`interrupt()` 暂停展示大纲）再到 `writing`；用户输入修改意见时经条件边 `route_review` 回 `human_review` 先重写大纲、再二次确认；默认关闭直接到 `writing`，该节点完全不执行。
 
 3. **大纲子智能体（`agents/outliner.py`）**：一个编译好的**自包含子图**，挂到主图的 `outline` 节点，负责"检索 + 生成提纲"一体：
    - **搜索**：把对话交给模型（带 `web_search` 工具），模型一次提出 3-5 个具体查询，用 `ThreadPoolExecutor` **并发**执行搜索（上限 4）；
@@ -231,7 +226,7 @@ python main.py --clear-search-cache
    - **失败分类路由**：素材不足（搜索失败/审查太差）→ 补搜（≤2 轮）；提纲不合格 → 换提示重试（≤2 次）；都到上限 → 基于自身知识兜底。**保证最终一定返回可用的 outline**。
    - 补搜 / 重试计数（`search_round` / `outline_attempt`）都是子图私有键，不会泄漏回主图 state（对 langgraph 1.2.11 实测验证）。
 
-4. **写作（`agents/writer.py` + `agents/section_writer.py`）**：`writer.py` 先用 `split` 把提纲拆成 5-7 个结构化章节，再用 `Send` API **并行**触发 `write_section`；每个 `write_section` 实例是 `section_writer.py` 的**自包含子图**——初稿 → 启发式自检（篇幅 / 标题 / 要点覆盖，不调 LLM）→ 不合格且未到上限则**条件重写**（自检意见塞回生成提示），合格直接结束。最后按序合并（`merge`）；打回只重写 `failed_sections` 里的问题章节（其余章节草稿保留），并把**该章节专属的审校意见**分别交给对应的重写章节，互不串味。
+4. **写作（`agents/writing.py` + `agents/section_writer.py`）**：`writing.py` 是**自包含子图**，内部先用 `split` 把提纲拆成 5-7 个结构化章节，再用 `Send` API **并行**触发 `write_section`；每个 `write_section` 实例是 `section_writer.py` 的**自包含子图**——初稿 → 启发式自检（篇幅 / 标题，不调 LLM）→ 不合格且未到上限则**条件重写**（自检意见塞回生成提示），合格直接结束。最后按 id 合并（`merge`）；打回只重写 `failed_sections` 里的问题章节（其余章节草稿保留），并把**该章节专属的审校意见**分别交给对应的重写章节，互不串味。`output_schema` 只把 `draft`/`sections`/`section_drafts` 写回主图（后两者是跨打回循环的共享通道）。
 
 5. **审校（`agents/editor.py`）**：用 `json_mode=True` 让模型输出 JSON（分数/是否合格/意见/润色全文），解析后写入多个状态字段；润色时保持 Markdown 标题结构；**解析失败自动重试**（最多 2 次，提示附"不是合法 JSON"），重试耗尽才保守按通过处理，避免卡死循环。
 
@@ -241,6 +236,13 @@ python main.py --clear-search-cache
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v2.4 — 写作子 Agent：拆章 + 并行写章 + 合并封装为自包含子图
+
+- **新增 `agents/writing.py`**：把"拆章（`split`）→ Send 并行触发章节写作子智能体（`write_section`）→ 按 id 合并（`merge`）"整条链收进一个**自包含子图**，作为主图单个 `writing` 节点挂载（`agents/writer.py` 迁入 `agents/writing.py`）。主图简化为 `outline →（可选人工确认）→ writing → edit`。
+- **审校留在主图**：打回重写时主图**再次进入** writing 子图；`sections`/`section_drafts` 作为共享通道跨父子图双向流动，`split` 在 `revision_count>0` 时复用已拆章节（不调 LLM）、`fan_out` 只 Send 问题章节并携带该章专属意见，保住"只重写问题章节、其余草稿保留"语义。
+- **双层 output_schema**：section_writer 子图限 `section_drafts`（消除子图内并行实例写冲突）+ writing 子图限 `draft/sections/section_drafts`（消除父图写冲突），主图永不出现并发写。
+- **merge 显式按 id 排序**：`sorted(sections, key=id)` 拼装，不依赖列表序（原 enumerate 保证列表序==id 序，行为不变，更稳健）。
 
 ### v2.3 — 搜索素材缓存 + 知识复用（两级缓存）
 
@@ -302,7 +304,7 @@ python main.py --clear-search-cache
 
 ### v1.4 — 按章节并发写作 + 搜索并行化
 
-- **按章节并发写作**：提纲拆成 5-7 个结构化章节，用 LangGraph `Send` API **并行**写各章节再按序合并——写作阶段大幅提速（`agents/writer.py` 拆为 `split` / `fan_out_write` / `write_section` / `merge` 四部分）。
+- **按章节并发写作**：提纲拆成 5-7 个结构化章节，用 LangGraph `Send` API **并行**写各章节再按序合并——写作阶段大幅提速（写作链封装在 `agents/writing.py`，内部 `split` / `fan_out_write` / `write_section` / `merge`）。
 - **只重写问题章节**：审校 JSON 新增 `failed_sections` 字段，打回时只重新写作出问题的章节、其余保留；拆章结果在打回时复用、不重复调用模型。
 - **搜索并行化**：大纲子智能体一轮提出 3-5 个查询，用 `ThreadPoolExecutor` 并发搜索（上限 4），节省时间、覆盖更多关键词。
 
