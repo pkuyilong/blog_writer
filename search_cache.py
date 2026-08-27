@@ -100,16 +100,23 @@ def cached_search(query: str, *, ttl: float = DEFAULT_TTL) -> str:
         _searching[key] = True
     try:
         result = web_search(query)
-    finally:
+    except Exception:
+        # 搜索失败:清"正在搜索"标志并唤醒等待线程,不写库;异常向上抛
         with _cond:
             _searching[key] = False
-            _cond.notify_all()  # 唤醒等待同 key 的线程
+            _cond.notify_all()
+        raise
+    # 先写库再唤醒:保证被唤醒的等待线程 re-check 时能读到结果. 否则 notify 与
+    # INSERT 之间的窗口会让等待线程误判 miss 再次搜索, 单飞失效(真实并发偶发
+    # 重复搜索, 由 tests/test_search_cache.py T6 复现)
     with _cond:
         conn.execute(
             "INSERT OR REPLACE INTO search_cache (query, result, created_at) VALUES (?, ?, ?)",
             (key, result, time.time()),
         )
         conn.commit()
+        _searching[key] = False
+        _cond.notify_all()  # 唤醒等待同 key 的线程
     return result
 
 

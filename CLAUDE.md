@@ -39,7 +39,7 @@ python main.py "题目" --model deepseek-v4-flash
 python main.py --clear-search-cache
 
 # 确定性控制流测试（mock chat/cached_search，不耗 token）
-.venv/bin/python /Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py
+.venv/bin/python tests/test_outliner_subagent.py
 ```
 
 ## 架构与数据流
@@ -99,6 +99,7 @@ outline 子图（agents/outliner.py，自包含）：
 ## 关键设计决策与踩过的坑（务必阅读）
 
 1. **孤儿 tool 消息问题（最坑）**：OpenAI 兼容 API 要求 tool 消息必须跟在含 `tool_calls` 的 assistant 消息后面。程序**主动**发起的补搜如果往上一轮对话里追加 tool 消息（没有对应的 assistant tool_calls）会直接 400。**解法：`search` 节点每次进入都重新构建干净对话**（`messages = [user: 题目]`），搜索轮次之间绝不累积消息。改这块时务必保持这个不变量。
+    - **补搜轮带历史查询上下文（不破坏本不变量）**：`search` 节点新增子图私有键 `search_history: list[str]`，记录每轮实际执行的查询关键词（**去重保序**，`list(dict.fromkeys(history + new_queries))`）。补搜轮（`round_n>1`）重进 search 时，把 history 以**纯文本**拼进 user 消息（`【上一轮搜索记录】…请避免重复搜索、针对缺失角度补充新查询`），让模型避免重复盲搜、针对缺失角度定向补搜。关键：**只拼进 user 消息、不追加 tool 消息**——"重建干净对话、绝不累积消息"的不变量原样成立，只是 user 文本更厚。每轮执行完搜索把新查询并入 history 并写回；**命中 topic 缓存的分支不带 history**（返回时不写该键、保留原值——命中即素材够用、根本不会进补搜，写不写无影响）。
 
 2. **子图私有键不泄漏（langgraph 1.2.11 实测）**：子图作为父图节点时，`OutlineState` 里的私有键（`search_round` / `outline_attempt` / `materials`）**不会写回父图 `ArticleState`**，且私有计数能跨子图内部自循环正确递增。所以补搜/重试计数放子图私有，不用加到 `ArticleState`。若升级 langgraph，需回归验证这一点。
 
@@ -165,13 +166,13 @@ outline 子图（agents/outliner.py，自包含）：
 ## 测试方法
 
 - **确定性控制流测试**：在模块层替换 `O.chat` / `O.cached_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。注意 v2.3 起还需 mock `O.get_cached_materials`/`O.store_materials`（防连真库，见决策 #15）。
-- 参考：`/Users/power/.claude/jobs/4cc34a38/tmp/test_outliner_subagent.py`（25 项检查）。核心断言模式：场景 A（素材够，1 轮收敛，chat=3）、B（补搜，chat=5）、C（两轮失败兜底，chat=5）、D（提纲两次太短兜底）、E（重试收敛，chat=4）、F（私有键不泄漏）、G（主图节点链 {outline, writing, edit} + outline/writing 节点是 `CompiledStateGraph`）、H（并行搜索 3 查询）。
-- 按章节并行写作：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_writer.py`（16 项检查）——mock 主图全部 LLM（`agents.writing.call_llm`/`agents.section_writer.call_llm`/`agents.review.call_llm`/`agents.outliner.chat`），走完整链路验证：split 调 1 次 → write_section 子图 ×N（计数加锁，per-title 版本号断言、不依赖并行执行顺序）→ merge 按 id 顺序正确 → 审核子智能体多数不过 → 打回只重写问题章节（旧草稿被覆盖、其余保留、专属意见传递）→ 二轮三角色全过 → 子图私有键不泄漏。审校按"轮"计数（每轮 = 3 角色各 1 次，共 2 轮 6 次）。这条测试同时守护「共享通道跨子图边界写回」——若 sections/section_drafts 没写回父图，重写轮会丢 v1。
-- 章节写作子智能体：`/Users/power/.claude/jobs/4cc34a38/tmp/test_section_subagent.py`（16 项检查）——mock `agents.section_writer.call_llm`，覆盖首写合格（不触发自检重写，对比旧版无条件反思省 1 次）/ 不合格→重写收敛 / 两次不合格接受 / 审校意见传递 / 要点不做子串检查（避免误判）/ 输出 schema 只暴露 section_drafts。
-- 审核子智能体：`/Users/power/.claude/jobs/4cc34a38/tmp/test_review_agent.py`（替代 test_editor_retry.py）——mock `agents.review.call_llm`（fake 用 `kw["role"]` 区分角色，Send 并行顺序不保证、断言用集合），子图直调 `build_review_agent().invoke(...)`，覆盖 3 角色各调一次 / 多数通过（2 票）/ 多数不过（failed_sections 按 id 合并、【角色名】前缀、id 升序）/ 分数均值（含四舍五入）/ 单角色解析失败重试（第二次 user_content 含"不是合法 json"）/ 弃权不拉偏（2 过+1 弃权通过、1 过+1 不过+1 弃权不过、全弃权保守通过）/ revision_count 只 +1 / output_schema 不泄漏私有键。
-- 人工介入：`/Users/power/.claude/jobs/4cc34a38/tmp/test_human_review.py`（21 项检查）——mock `agents.human_review.input`（编程序列）与 `call_llm`，单测节点四种输入（回车/意见重写/粘贴大纲/q 退出）+ 整图开关开走通 + 开关关不触发节点 + 跨进程断点续跑。
-- 多模型路由：`/Users/power/.claude/jobs/4cc34a38/tmp/test_model_router.py`（24 项检查）——mock `llm.get_client`（fake client）与 `llm.call_with_fallback`（spy），覆盖 role 路由解析 / `__default__` 哨兵→全局默认 / `set_default_model` 覆盖 / 能力过滤（role 链跳过 vs 显式 model 报错）/ fallback 成功与耗尽（保留 `__cause__`）/ 审校 3 个角色 role 正确传递（跑 `build_review_agent().invoke` 断言最近 3 次调用是 edit_lang/edit_logic/edit_fact）/ 旧无参行为不变 / client 懒加载缓存与缺 env 报错。
-- 搜索缓存：`/Users/power/.claude/jobs/4cc34a38/tmp/test_search_cache.py`（18 项检查）——mock `search_cache.web_search`（临时库隔离，覆盖 `DB_PATH`），覆盖 query 级 miss/命中 / key 规范化（首尾空白、大小写）/ TTL 过期重新搜索 / topic 级 store→hit→过期 miss / `clear()` 清空并返回条数 / **并发单飞（8 线程同 query，真实搜索次数 == 1）** / 空 key 不缓存。
+- 参考：`tests/test_outliner_subagent.py`（27 项检查）。核心断言模式：场景 A（素材够，1 轮收敛，chat=3）、B（补搜，chat=5，**断言补搜轮 user 消息带首轮查询记录、首轮不带**）、C（两轮失败兜底，chat=5）、D（提纲两次太短兜底）、E（重试收敛，chat=4）、F（私有键不泄漏，含 `search_history`）、G（主图节点链 {outline, writing, edit} + outline/writing 节点是 `CompiledStateGraph`）、H（并行搜索 3 查询）。
+- 按章节并行写作：`tests/test_section_writer.py`（17 项检查）——mock 主图全部 LLM（`agents.writing.call_llm`/`agents.section_writer.call_llm`/`agents.review.call_llm`/`agents.outliner.chat`），走完整链路验证：split 调 1 次 → write_section 子图 ×N（计数加锁，per-title 版本号断言、不依赖并行执行顺序）→ merge 按 id 顺序正确 → 审核子智能体多数不过 → 打回只重写问题章节（旧草稿被覆盖、其余保留、专属意见传递）→ 二轮三角色全过 → 子图私有键不泄漏。审校按"轮"计数（每轮 = 3 角色各 1 次，共 2 轮 6 次）。这条测试同时守护「共享通道跨子图边界写回」——若 sections/section_drafts 没写回父图，重写轮会丢 v1。
+- 章节写作子智能体：`tests/test_section_subagent.py`（16 项检查）——mock `agents.section_writer.call_llm`，覆盖首写合格（不触发自检重写，对比旧版无条件反思省 1 次）/ 不合格→重写收敛 / 两次不合格接受 / 审校意见传递 / 要点不做子串检查（避免误判）/ 输出 schema 只暴露 section_drafts。
+- 审核子智能体：`tests/test_review_agent.py`（替代 test_editor_retry.py）——mock `agents.review.call_llm`（fake 用 `kw["role"]` 区分角色，Send 并行顺序不保证、断言用集合），子图直调 `build_review_agent().invoke(...)`，覆盖 3 角色各调一次 / 多数通过（2 票）/ 多数不过（failed_sections 按 id 合并、【角色名】前缀、id 升序）/ 分数均值（含四舍五入）/ 单角色解析失败重试（第二次 user_content 含"不是合法 json"）/ 弃权不拉偏（2 过+1 弃权通过、1 过+1 不过+1 弃权不过、全弃权保守通过）/ revision_count 只 +1 / output_schema 不泄漏私有键。
+- 人工介入：`tests/test_human_review.py`（22 项检查）——mock `agents.human_review.input`（编程序列）与 `call_llm`，单测节点四种输入（回车/意见重写/粘贴大纲/q 退出）+ 整图开关开走通 + 开关关不触发节点 + 跨进程断点续跑。
+- 多模型路由：`tests/test_model_router.py`（25 项检查）——mock `llm.get_client`（fake client）与 `llm.call_with_fallback`（spy），覆盖 role 路由解析 / `__default__` 哨兵→全局默认 / `set_default_model` 覆盖 / 能力过滤（role 链跳过 vs 显式 model 报错）/ fallback 成功与耗尽（保留 `__cause__`）/ 审校 3 个角色 role 正确传递（跑 `build_review_agent().invoke` 断言最近 3 次调用是 edit_lang/edit_logic/edit_fact）/ 旧无参行为不变 / client 懒加载缓存与缺 env 报错。
+- 搜索缓存：`tests/test_search_cache.py`（18 项检查）——mock `search_cache.web_search`（临时库隔离，覆盖 `DB_PATH`），覆盖 query 级 miss/命中 / key 规范化（首尾空白、大小写）/ TTL 过期重新搜索 / topic 级 store→hit→过期 miss / `clear()` 清空并返回条数 / **并发单飞（8 线程同 query，真实搜索次数 == 1）** / 空 key 不缓存。
 - **真实 e2e**：跑 `python main.py "题目" --output out.md`，检查日志出现补搜/重试提示、成品是合法 Markdown、质量分正常。注意真实搜索 + LLM 调用可能超过 5 分钟，超时后转后台即可。
 
 ## 安全注意事项

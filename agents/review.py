@@ -114,7 +114,14 @@ def _parse_review_output(raw: str) -> tuple[int, bool, list[dict]]:
     重试循环调用:解析失败就重试,重试耗尽该角色弃权.
     """
     data = json.loads(raw)
-    score = int(data.get("score", 60))  # 非整数值会抛 ValueError,触发重试
+    if not isinstance(data, dict):
+        # 模型输出 JSON 数组/裸值/null 时 data.get 会抛 AttributeError/TypeError,
+        # 归一成 ValueError 让重试循环接管(否则会击穿整图,见 CLAUDE.md 决策 #5)
+        raise ValueError("审校输出不是 json 对象，无法解析")
+    raw_score = data.get("score", 60)
+    if raw_score is None:
+        raise ValueError("score 字段为空，无法解析")
+    score = int(raw_score)  # 非整数值会抛 ValueError,触发重试
     passed = bool(data.get("passed", True))  # 沿用旧宽松默认 True
     failed_sections = _parse_failed_sections(data.get("failed_sections", []))
     return score, passed, failed_sections

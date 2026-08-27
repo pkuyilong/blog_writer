@@ -64,6 +64,7 @@ class OutlineState(TypedDict):
     outline: str
     outline_attempt: int  # 私有:提纲重试计数
     search_round: int  # 私有:搜索轮次计数
+    search_history: list[str]  # 私有:已执行过的查询关键词(供补搜轮带上下文,避免重复盲搜)
 
 
 def _usable(outline: str) -> bool:
@@ -102,8 +103,23 @@ def search(state: OutlineState) -> dict:
         return {"materials": hit, "search_round": state.get("search_round", 0) + 1}
     round_n = state.get("search_round", 0) + 1
     logger.info(f"  🔍 大纲子智能体搜索素材（第 {round_n} 轮）…")
+    # 补搜轮(round_n>1)把已执行过的查询列表以纯文本带进 user 消息:让模型避免
+    # 重复搜索、针对上一轮缺失的角度定向补搜。只塞进 user 消息、不追加 tool 消息,
+    # 保持"孤儿 tool 消息"不变量(见 CLAUDE.md 决策 #1)。
+    history = list(state.get("search_history") or [])
+    history_extra = ""
+    if history:
+        history_extra = (
+            "\n\n【上一轮搜索记录】\n"
+            "以下关键词在上一轮已搜索过，本次是补充搜索：\n"
+            + "\n".join(f"- {q}" for q in history)
+            + "\n请避免重复搜索上述关键词，针对上一轮素材缺失的角度补充新的查询。"
+        )
     messages = [
-        {"role": "user", "content": f"文章题目：{state['topic']}\n请开始调研。"}
+        {
+            "role": "user",
+            "content": f"文章题目：{state['topic']}\n请开始调研。{history_extra}",
+        }
     ]
 
     # 阶段一:让模型规划搜索(一次可请求多个查询),并执行全部搜索
@@ -113,6 +129,13 @@ def search(state: OutlineState) -> dict:
         # 模型认为不需要搜索:直接把它给出的内容当作素材
         materials = msg.content or ""
     else:
+        # 记录本轮实际执行的查询(去重保序),写回私有键供下一轮补搜参考
+        new_queries = []
+        for tc in msg.tool_calls:
+            q = json.loads(tc.function.arguments).get("query", "")
+            if q:
+                new_queries.append(q)
+        history = list(dict.fromkeys(history + new_queries))
         # 把含工具调用的助手消息放回对话,逐条执行搜索
         messages.append(
             {
@@ -164,7 +187,7 @@ def search(state: OutlineState) -> dict:
     # 素材可用才写入 topic 缓存(不足素材不缓存, 避免下次命中坏缓存再触发补搜)
     if _materials_ok(materials):
         store_materials(state["topic"], materials)
-    return {"materials": materials, "search_round": round_n}
+    return {"materials": materials, "search_round": round_n, "search_history": history}
 
 
 def should_search_again(state: OutlineState) -> str:

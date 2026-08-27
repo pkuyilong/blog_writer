@@ -206,11 +206,17 @@ def main() -> int:
         logger.error('错误：需要题目（python main.py "题目"）或 --resume <thread_id>')
         return 1
 
-    # if args.in_memory:
-    #     from langgraph.checkpoint.memory import MemorySaver
+    if args.in_memory:
+        if args.resume:
+            logger.error(
+                "--in-memory 用 MemorySaver（进程内、退出即失），无法 --resume 断点续跑。"
+                "请去掉 --in-memory，用默认 SqliteSaver 才能跨进程续跑。"
+            )
+            return 1
+        from langgraph.checkpoint.memory import MemorySaver
 
-    #     logger.info("使用 MemorySaver（进程内、退出即失；仅供对比学习）")
-    #     return _run(args, MemorySaver())
+        logger.info("使用 MemorySaver（进程内、退出即失；仅供对比学习）")
+        return _run(args, MemorySaver())
 
     # SqliteSaver.from_conn_string 返回 context manager,必须 with 解包取实例;
     # 直接把 context manager 传给 compile(checkpointer=...) 会报 TypeError
