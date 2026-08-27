@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blog_writer Web 控制台</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --border: #e2e5ea;
+    --text: #1f2328;
+    --muted: #6a737d;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --danger: #dc2626;
+    --ok: #16a34a;
+    --wait: #d97706;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 22px; }
+  #status-bar {
+    font-size: 13px; padding: 3px 12px; border-radius: 999px;
+    background: #e8eaed; color: var(--muted);
+  }
+  #status-bar.status-running { background: #e0f2fe; color: #0369a1; }
+  #status-bar.status-waiting { background: #fef3c7; color: var(--wait); }
+  #status-bar.status-done { background: #dcfce7; color: var(--ok); }
+  #status-bar.status-error { background: #fee2e2; color: var(--danger); }
+  section {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; margin-top: 20px;
+  }
+  h2 { margin: 0 0 14px; font-size: 16px; }
+  label { display: block; margin-bottom: 12px; font-size: 14px; color: var(--muted); }
+  input[type="text"], select, textarea {
+    display: block; width: 100%; margin-top: 6px; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 6px; font-size: 14px;
+    font-family: inherit; background: #fff; color: var(--text);
+  }
+  input[type="text"]:disabled, select:disabled, textarea:disabled { background: #f1f3f5; color: var(--muted); }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; color: var(--text); }
+  .checkbox-row input { width: 16px; height: 16px; }
+  .btn {
+    display: inline-block; padding: 9px 18px; border: none; border-radius: 6px;
+    font-size: 14px; cursor: pointer; background: var(--primary); color: #fff;
+  }
+  .btn:hover:not(:disabled) { background: var(--primary-hover); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-ghost { background: #e8eaed; color: var(--text); }
+  .btn-ghost:hover:not(:disabled) { background: #d7dade; }
+  .btn-danger { background: var(--danger); }
+  .btn-danger:hover:not(:disabled) { background: #b91c1c; }
+  .btn-row { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+  .review-actions { margin-top: 16px; border-top: 1px dashed var(--border); padding-top: 16px; }
+  .review-row { margin-top: 12px; }
+  .review-row textarea { min-height: 64px; }
+  .review-row .btn { margin-top: 8px; }
+  pre.outline {
+    background: #f8f9fb; border: 1px solid var(--border); border-radius: 6px;
+    padding: 14px; white-space: pre-wrap; font-size: 13px; overflow-x: auto;
+  }
+  #result-section pre {
+    background: #f8f9fb; border: 1px solid var(--border); border-radius: 6px;
+    padding: 16px; white-space: pre-wrap; font-size: 14px; overflow-x: auto;
+  }
+  #error-box { background: #fee2e2; border: 1px solid #fca5a5; color: var(--danger); border-radius: 6px; padding: 12px; }
+  #meta { font-size: 13px; color: var(--muted); margin: 8px 0; }
+  #toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    background: #1f2328; color: #fff; padding: 9px 16px; border-radius: 6px;
+    font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>📝 blog_writer</h1>
+    <span id="status-bar">空闲</span>
+  </header>
+
+  <!-- ① 选项控制 -->
+  <section id="form-section">
+    <h2>生成选项</h2>
+    <label>文章题目
+      <input type="text" id="topic" placeholder="如：为什么越来越多的人选择远程办公">
+    </label>
+    <label>模型
+      <select id="model"></select>
+    </label>
+    <label class="checkbox-row">
+      <input type="checkbox" id="human-review">
+      生成大纲后由我人工确认（可修改 / 重写大纲后再继续）
+    </label>
+    <div class="btn-row">
+      <button class="btn" id="btn-run">开始生成</button>
+      <button class="btn btn-danger" id="btn-cancel" hidden>取消任务</button>
+    </div>
+  </section>
+
+  <!-- ② 人工干预：大纲确认区 -->
+  <section id="review-section" hidden>
+    <h2>👀 请审阅大纲</h2>
+    <pre class="outline" id="outline"></pre>
+    <div class="review-actions">
+      <button class="btn" id="btn-confirm">✅ 确认大纲，继续写作</button>
+      <div class="review-row">
+        <textarea id="feedback" placeholder="输入修改意见（如：补充背景数据），将由 AI 按意见重写大纲"></textarea>
+        <button class="btn btn-ghost" id="btn-revise">✍️ 按意见修改</button>
+      </div>
+      <div class="review-row">
+        <textarea id="replace-outline" placeholder="或粘贴一份完整新大纲，直接采用"></textarea>
+        <button class="btn btn-ghost" id="btn-replace">📋 采用此大纲</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ③ 最终结果展示 -->
+  <section id="result-section" hidden>
+    <h2 id="result-heading">成品文章</h2>
+    <div id="error-box" hidden></div>
+    <div id="meta"></div>
+    <pre id="article"></pre>
+  </section>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+// ---------- DOM ----------
+const statusBar = document.getElementById("status-bar");
+const topicInput = document.getElementById("topic");
+const modelSelect = document.getElementById("model");
+const reviewCheck = document.getElementById("human-review");
+const btnRun = document.getElementById("btn-run");
+const btnCancel = document.getElementById("btn-cancel");
+const reviewSection = document.getElementById("review-section");
+const outlinePre = document.getElementById("outline");
+const btnConfirm = document.getElementById("btn-confirm");
+const btnRevise = document.getElementById("btn-revise");
+const btnReplace = document.getElementById("btn-replace");
+const feedbackInput = document.getElementById("feedback");
+const replaceInput = document.getElementById("replace-outline");
+const resultSection = document.getElementById("result-section");
+const resultHeading = document.getElementById("result-heading");
+const errorBox = document.getElementById("error-box");
+const metaEl = document.getElementById("meta");
+const articlePre = document.getElementById("article");
+
+const STATUS_TEXT = { idle: "空闲", running: "生成中…", waiting: "等待大纲确认", done: "完成", error: "出错" };
+
+let lastOutline = null;  // 记录最近展示的大纲,内容变化才重新启用 resume 按钮
+let toastTimer = null;
+
+// ---------- 工具 ----------
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+async function postJSON(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+// ---------- 渲染 ----------
+function enableResumeButtons(on) {
+  btnConfirm.disabled = !on;
+  btnRevise.disabled = !on;
+  btnReplace.disabled = !on;
+}
+
+function render(s) {
+  const st = s.status;
+  statusBar.textContent = STATUS_TEXT[st] || st;
+  statusBar.className = "status-" + st;
+
+  // 表单区:running/waiting 时禁用,防止并发改动
+  const busy = (st === "running" || st === "waiting");
+  topicInput.disabled = busy;
+  modelSelect.disabled = busy;
+  reviewCheck.disabled = busy;
+  btnRun.disabled = busy;
+  // cancel 仅对 waiting 有效(running 阶段 graph.invoke 原子执行无法中断),只在等待确认时显示
+  btnCancel.hidden = (st !== "waiting");
+
+  // 大纲确认区
+  if (st === "waiting") {
+    reviewSection.hidden = false;
+    outlinePre.textContent = s.outline || "(空大纲)";
+    if (s.outline !== lastOutline) {   // 初次进入 或 revise 二次中断出新大纲 → 重新启用
+      enableResumeButtons(true);
+      lastOutline = s.outline;
+    }
+  } else {
+    reviewSection.hidden = true;
+    lastOutline = null;
+  }
+
+  // 结果区
+  if (st === "done") {
+    resultSection.hidden = false;
+    resultHeading.textContent = "✅ 成品文章";
+    errorBox.hidden = true;
+    metaEl.textContent = "质量分 " + (s.quality_score ?? "N/A") + "/100 · 审校 " + (s.revision_count ?? 0) + " 次";
+    articlePre.textContent = s.final_article || "(空)";
+  } else if (st === "error") {
+    resultSection.hidden = false;
+    resultHeading.textContent = "❌ 出错了";
+    errorBox.hidden = false;
+    errorBox.textContent = s.error || "未知错误";
+    metaEl.textContent = "";
+    articlePre.textContent = "";
+  } else {
+    resultSection.hidden = true;
+  }
+}
+
+// ---------- 轮询 ----------
+async function poll() {
+  try {
+    const r = await fetch("/api/status");
+    render(await r.json());
+  } catch (e) { /* 服务刚启动/短暂不可达时静默忽略 */ }
+}
+
+// ---------- 模型下拉 ----------
+async function loadModels() {
+  try {
+    const r = await fetch("/api/models");
+    const d = await r.json();
+    modelSelect.innerHTML = "";
+    for (const m of d.models) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m;
+      if (m === d.default) opt.selected = true;
+      modelSelect.appendChild(opt);
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+// ---------- 操作 ----------
+btnRun.onclick = async () => {
+  const topic = topicInput.value.trim();
+  if (!topic) { showToast("请先填写文章题目"); return; }
+  btnRun.disabled = true;
+  try {
+    const r = await postJSON("/api/run", {
+      topic: topic,
+      model: modelSelect.value,
+      human_review: reviewCheck.checked,
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      showToast("启动失败(" + r.status + "): " + (d.detail || ""));
+      btnRun.disabled = false;
+    }
+    // 成功则保持禁用,等轮询反映状态;全自动任务可能直接变 done
+  } catch (e) {
+    showToast("网络错误: " + e);
+    btnRun.disabled = false;
+  }
+};
+
+function submitResume(payload) {
+  enableResumeButtons(false);  // 乐观禁用,防重复提交
+  postJSON("/api/resume", payload).then(async (r) => {
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      showToast("提交失败(" + r.status + "): " + (d.detail || ""));
+      enableResumeButtons(true);
+    }
+    // 成功则保持禁用;下次轮询 status 变 running 大纲区隐藏,或 revise 出新一轮大纲时重新启用
+  }).catch((e) => { showToast("网络错误: " + e); enableResumeButtons(true); });
+}
+
+btnConfirm.onclick = () => submitResume({ action: "confirm" });
+
+btnRevise.onclick = () => {
+  const feedback = feedbackInput.value.trim();
+  if (!feedback) { showToast("请先输入修改意见"); return; }
+  submitResume({ action: "revise", feedback: feedback });
+  feedbackInput.value = "";
+};
+
+btnReplace.onclick = () => {
+  const outline = replaceInput.value.trim();
+  if (!outline) { showToast("请先粘贴完整新大纲"); return; }
+  submitResume({ action: "replace", outline: outline });
+  replaceInput.value = "";
+};
+
+btnCancel.onclick = async () => {
+  const r = await postJSON("/api/cancel");
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    showToast("取消失败(" + r.status + "): " + (d.detail || ""));
+  }
+};
+
+// ---------- 启动 ----------
+loadModels();
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

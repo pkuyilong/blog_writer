@@ -11,6 +11,7 @@
 - 搜索：**DuckDuckGo**（`ddgs` 库，免费无需 Key），`region=cn-zh` 提升中文结果质量。**两级搜索缓存**（`search_cache.py`）：query 级缓存 `web_search` 原始结果 + topic 级缓存审查后素材（SQLite `.cache/` 跨进程复用，TTL 7 天，`--clear-search-cache` 清空）。
 - 主图节点：`outline`（子图）→ `writing`（写作子 Agent 子图，内部 `split` → `write_section`（子图，Send 并行 ×N）→ `merge`）→ `edit`（审核子智能体，内部 3 角色并行打分 + 多数表决；条件边打回只重写问题章节，最多 2 次）。
 - 搜索：outliner 子图内 **ThreadPool 并行**（`MAX_PARALLEL_SEARCHES=4`）；写作按章节 **Send 图级并行**。
+- **Web 页面版**（`web_server.py` + `web/index.html`，可选）：FastAPI 本地服务，浏览器完成 选项控制（题目/模型/人工确认开关）/ 大纲人工确认 / 成品展示；复用 CLI 同一套 `interrupt()`/`Command(resume)` 协议，**图逻辑零改动**。
 
 ## 常用命令
 
@@ -37,6 +38,10 @@ python main.py "题目" --model deepseek-v4-flash
 
 # 清空搜索素材缓存（.cache/，除 TTL 7 天自动过期外的强制清空；清空后退出）
 python main.py --clear-search-cache
+
+# Web 页面版：浏览器里填题目/选模型/人工确认，页面展示大纲确认与成品（必须单 worker）
+.venv/bin/python -m uvicorn web_server:app --port 8000
+# 打开 http://localhost:8000
 
 # 确定性控制流测试（mock chat/cached_search，不耗 token）
 .venv/bin/python tests/test_outliner_subagent.py
@@ -94,6 +99,7 @@ outline 子图（agents/outliner.py，自包含）：
 | `agents/review.py` | **审核子智能体**（自包含子图，挂 `edit` 节点）：`START →(fan_out_reviewers: Send×3)→ review_role(并行×3) → aggregate`；3 个审校角色（语言/逻辑/事实）各自独立 `call_llm(json_mode=True, role=edit_xxx)` 输出 JSON（score/passed/**failed_sections**[{id,feedback}]）；多数表决（≥2/3）+ 解析失败重试 `REVIEW_MAX_RETRIES` 次、耗尽**弃权**、全弃权保守通过；`output_schema` 只写回 {final_article, quality_score, passed, failed_sections, revision_count}；**取消润色**（final_article=当前 draft） |
 | `agents/human_review.py` | **人工介入节点**：`interrupt()` 暂停把大纲交给客户端，按 `Command(resume=...)` 的 action（confirm/revise/replace）决定下一步；revise 时把 `outline_review_feedback` 写进 state、经 `route_review` 条件边回环，节点开头按意见重写（REVISE_OUTLINE_PROMPT）再二次确认；`build_graph(enable_human_review=True)` 经条件边启用 |
 | `langsmith_config.py` | LangSmith 配置：读 `.env`、校验环境变量、设置项目名 |
+| `web_server.py` | **Web 页面版后端**（可选）：FastAPI + 单任务运行器（后台 worker 线程跑图，`__interrupt__` 用 `threading.Condition` 挂起、resume API 唤醒续跑）+ 1 个页面路由 `GET /` 与 5 个 API 路由（`/api/models` `/api/run` `/api/status` `/api/resume` `/api/cancel`）；`web/index.html` 是单页前端（表单 / 大纲确认 / 结果展示，`setInterval` 轮询 status） |
 | `logging_config.py` | 统一日志：所有模块用 `logging` 替代 print；stderr 简洁输出（保留 emoji 观感）+ 文件（默认 `blog_writer.log`）详细追踪；`--verbose` 控制终端级别；`setup_logging()` 幂等 |
 
 ## 关键设计决策与踩过的坑（务必阅读）
@@ -163,6 +169,15 @@ outline 子图（agents/outliner.py，自包含）：
     - **共享通道跨重写循环**：`sections`/`section_drafts` 同时声明在 `ArticleState` 与 `WritingState`，既是输入也是输出。重写时主图再次进入 writing，父图注入这些键 → split 复用、fan_out 只 Send 失败章节、merge 重组，并把更新后的 sections/section_drafts 经 `WritingOutput` 写回父图。**必须写回**，否则下一轮循环丢失章节/旧草稿。
     - **merge 显式按 id 排序**：`sorted(sections, key=id)`——不再隐式依赖 split 的 enumerate 列表序，更稳健（解决了「merge 没按 id 组合」的疑虑，行为不变）。
 
+17. **Web 页面版驱动层（web_server.py）——图逻辑零改动**：CLI 的 `_interactive_invoke`（main.py）是唯一把图绑在 stdin 的地方。Web 版用一个后台 worker 线程跑 `graph.invoke`，遇 `__interrupt__` 把大纲存进 TaskState 并用 `threading.Condition` 挂起；前端轮询 `/api/status` 拿大纲、`POST /api/resume` 提交 `{"action": confirm|revise|replace, ...}` 唤醒续跑。要点：
+    - **必须专用后台线程**：`graph.invoke` 同步分钟级、且每次在当前线程内部建/拆事件循环；放 asyncio 端点会冻结所有请求（ainvoke 会让外部循环与图内部循环纠缠），HTTP 线程永不进入图执行。
+    - **resume 双条件 409**：`waiting` 且 `resume_payload` 未消费才接受；worker 在锁内原子「消费 payload + 置 running」，`wait_for(predicate)` 防 missed-wakeup（resume 在 worker 进 wait 前已 notify 也会先查 predicate 直接放行）。
+    - **checkpointer 用 MemorySaver、每任务一个**：web 单任务单进程、无跨进程续跑诉求，避开 SqliteSaver 的线程安全与 `.checkpoints/` 文件锁（避免 web 与 CLI 并发写同一 sqlite 报 database is locked）；只在 worker 线程内触碰。
+    - **uvicorn 必须单 worker**：单槽注册表是进程级全局，`--workers N` 会把轮询打散到不同进程副本。
+    - **`set_default_model` 只在 worker 线程开头调用一次**（单写者），模型校验放 `/api/run` 端点（400）、生效放 worker；`replace` 用显式 action、textarea 是完整大纲原文，不沿用 CLI 的 `#` 前缀约定。
+    - **`revise` 会二次 interrupt**（`route_review` 自环），worker 的 while 循环 + outline 覆盖是硬要求；前端按「大纲内容变了就重新启用操作按钮」刷新确认框。
+    - **cancel 仅对 waiting 有效**：running 阶段 `graph.invoke` 原子执行、无法中途打断（打断会静默无效），所以 `/api/cancel` 只在 `waiting` 时接受（running → 409）、前端只在 waiting 显示取消按钮；waiting 取消后 worker 醒来置 `error="canceled"`。run 端点锁外 `build_graph` 失败（如缺 API key）会 try/except 清槽回 idle 再抛 500，绝不残留卡死的 running 槽位。
+
 ## 测试方法
 
 - **确定性控制流测试**：在模块层替换 `O.chat` / `O.cached_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。注意 v2.3 起还需 mock `O.get_cached_materials`/`O.store_materials`（防连真库，见决策 #15）。
@@ -173,6 +188,7 @@ outline 子图（agents/outliner.py，自包含）：
 - 人工介入：`tests/test_human_review.py`（22 项检查）——mock `agents.human_review.input`（编程序列）与 `call_llm`，单测节点四种输入（回车/意见重写/粘贴大纲/q 退出）+ 整图开关开走通 + 开关关不触发节点 + 跨进程断点续跑。
 - 多模型路由：`tests/test_model_router.py`（25 项检查）——mock `llm.get_client`（fake client）与 `llm.call_with_fallback`（spy），覆盖 role 路由解析 / `__default__` 哨兵→全局默认 / `set_default_model` 覆盖 / 能力过滤（role 链跳过 vs 显式 model 报错）/ fallback 成功与耗尽（保留 `__cause__`）/ 审校 3 个角色 role 正确传递（跑 `build_review_agent().invoke` 断言最近 3 次调用是 edit_lang/edit_logic/edit_fact）/ 旧无参行为不变 / client 懒加载缓存与缺 env 报错。
 - 搜索缓存：`tests/test_search_cache.py`（18 项检查）——mock `search_cache.web_search`（临时库隔离，覆盖 `DB_PATH`），覆盖 query 级 miss/命中 / key 规范化（首尾空白、大小写）/ TTL 过期重新搜索 / topic 级 store→hit→过期 miss / `clear()` 清空并返回条数 / **并发单飞（8 线程同 query，真实搜索次数 == 1）** / 空 key 不缓存。
+- Web 页面版：`tests/test_web_server.py`（33 项检查）——mock 全部 LLM（`O.chat`/`O.cached_search`/`W.call_llm`/`SW.call_llm`/`R.call_llm`/`HR.call_llm`，mock 套件与 test_section_writer 同一套），TestClient（httpx）驱动后台 worker 线程，覆盖 run→waiting→resume(confirm/revise/replace)→done 状态机（revise 用**谓词等待**防"拿到旧 waiting"竞态、replace 用 `run_until` 的**状态序列**守护"不二次 waiting"）、409/400 校验、cancel（waiting→202、**running→409**）、异常兜底、**run 端点 build_graph 失败→500 清槽回 idle**。**每个用例开头必须 `web_server._reset_for_tests()`**（单槽注册表是进程级全局，cancel→join 线程→清槽→恢复默认模型，否则拿到上个任务状态）。
 - **真实 e2e**：跑 `python main.py "题目" --output out.md`，检查日志出现补搜/重试提示、成品是合法 Markdown、质量分正常。注意真实搜索 + LLM 调用可能超过 5 分钟，超时后转后台即可。
 
 ## 安全注意事项

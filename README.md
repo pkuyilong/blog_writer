@@ -13,6 +13,7 @@
 - [安装](#安装)
 - [配置 API Key](#配置-api-key)
 - [运行](#运行)
+- [Web 页面版](#web-页面版)
 - [工作原理](#工作原理)
 - [重大改动记录](#重大改动记录)
 - [待办事项](#待办事项)
@@ -35,6 +36,7 @@
 - 📦 **搜索素材缓存（知识复用）**：搜索原始结果与整题审查后素材按 7 天 TTL 存进 SQLite（`.cache/`），同一题目/相似关键词跨运行复用，跳过重复联网与重复审查；`--clear-search-cache` 可手动清空
 - 📊 可选接入 **LangSmith** 追踪每次 Agent 执行与 LLM 调用（`llm.py` 用 `@traceable` 上报）
 - 💻 纯命令行使用，零界面依赖
+- 🌐 **Web 页面版**：FastAPI 起本地服务，浏览器里填题目 / 选模型 / 开关人工确认，大纲确认与成品展示都在页面完成（复用 CLI 同一套 interrupt/resume 协议，图逻辑零改动）
 
 ## 工作流程
 
@@ -72,7 +74,9 @@ blog_writer/
 │   ├── section_writer.py   # 章节写作子智能体（自包含子图：初稿 → 自检 → 条件重写）
 │   └── review.py           # 审核子智能体（自包含子图：3 角色并行打分 + 多数表决；解析失败弃权）
 ├── graph.py                # LangGraph 编排：大纲 →（人工确认）→ 写作子 Agent → 审校（含打回循环）
-└── main.py                 # CLI 入口（交互循环 + --resume 断点续跑 + checkpointer 装配）
+├── main.py                 # CLI 入口（交互循环 + --resume 断点续跑 + checkpointer 装配）
+├── web_server.py           # Web 页面版后端：FastAPI + 单任务运行器（interrupt 挂起 / resume 唤醒）
+└── web/index.html          # Web 页面版前端：表单 / 大纲确认 / 结果展示（原生 JS 轮询）
 ```
 
 ## 环境要求
@@ -162,6 +166,25 @@ python main.py "为什么越来越多的人选择远程办公" --model deepseek-
 python main.py --clear-search-cache
 ```
 
+## Web 页面版
+
+不想用命令行？可以起一个本地 Web 服务，在浏览器里完成"填题目 → 选模型 →（可选）人工确认大纲 → 看成品"全流程：
+
+```bash
+.venv/bin/python -m uvicorn web_server:app --port 8000
+# 打开浏览器访问 http://localhost:8000
+```
+
+页面三个区块：
+
+- **生成选项**：文章题目、模型下拉（`MODEL_REGISTRY` 里的名字）、"生成大纲后由我人工确认"开关。
+- **大纲确认**（勾选了人工确认时出现）：展示生成的大纲，可 **确认继续** / **输入意见让 AI 重写**（会二次展示重写后大纲再确认）/ **粘贴完整新大纲直接采用**。
+- **成品文章**：运行结束展示成品 + 质量分 / 审校次数；出错时展示错误信息。
+
+它复用了 CLI 同一套 LangGraph `interrupt()` / `Command(resume=...)` 协议，**图逻辑零改动**，只是把 `main.py` 的 stdin 交互循环换成了"后台线程跑图 + 前端轮询 + resume API"。**注意：必须单 worker 启动**（`uvicorn web_server:app`，不要加 `--workers N`）——单任务注册表是进程级全局，多进程会把轮询打散到不同副本。
+
+等待大纲确认时可以点 **取消任务**（`graph.invoke` 在搜索/写作阶段是原子执行、无法中途打断，所以取消按钮只在等待确认时出现）；完成后结果保留在页面，新任务会覆盖旧结果。
+
 运行时会依次显示各阶段提示：
 
 ```
@@ -238,6 +261,13 @@ python main.py --clear-search-cache
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v2.6 — Web 页面版：选项控制 + 人工干预 + 结果展示
+
+- **新增 `web_server.py` + `web/index.html`**：FastAPI 起本地服务，单页前端做三件事——选项控制（题目 / 模型下拉 / 人工确认开关）、人工干预（大纲确认区：确认 / 按意见修改 / 粘贴替换，复用 CLI 的 interrupt/resume 协议）、结果展示（成品文章 + 质量分 / 审校次数 / 错误信息）。**图逻辑零改动**（human_review 节点早已是正统 `interrupt()` 协议）。
+- **单任务运行器**：后台 worker 线程跑 `graph.invoke`，遇 `__interrupt__` 用 `threading.Condition` 挂起，前端轮询 `/api/status` 拿大纲、`POST /api/resume` 唤醒续跑；单槽注册表（同一时刻只跑一个任务，done 后保留结果供展示，新 run 才覆盖）；`MemorySaver` 每任务一个（web 无跨进程续跑诉求，避开 SqliteSaver 的文件锁并发问题）。
+- **API 契约**：`GET /`（页面）、`GET /api/models`（注册表 + 默认模型）、`POST /api/run`、`GET /api/status`、`POST /api/resume`（confirm/revise/replace）、`POST /api/cancel`；resume 双条件 409 防重复提交。
+- **约束**：uvicorn **必须单 worker**（单槽注册表是进程级全局）；`--output` / `--verbose` / `--resume` / `--in-memory` 等 CLI 参数不暴露给页面；replace 用显式 action、不沿用 CLI 的 `#` 前缀约定；`/api/cancel` 仅对 waiting（等待人工确认）有效，running 阶段 `graph.invoke` 原子执行无法中断（running → 409），前端只在 waiting 显示取消按钮。
 
 ### v2.5 — 审核子智能体：3 个审校角色独立打分 + 多数表决 + 取消润色
 

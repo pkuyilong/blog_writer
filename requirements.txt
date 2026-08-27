@@ -8,3 +8,8 @@ langgraph-langsmith
 langchain-core
 # 联网搜索（调研 Agent 用），无需 API Key
 ddgs
+# Web 页面版（web_server.py）服务端框架
+fastapi
+uvicorn[standard]
+# Web 测试（tests/test_web_server.py，TestClient 依赖）
+httpx
