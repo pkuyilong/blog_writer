@@ -14,6 +14,7 @@ import time
 
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -146,21 +147,23 @@ def web_search(query: str) -> str:
     return json.dumps(items, ensure_ascii=False)
 
 
-# 工具定义(OpenAI 兼容的 function schema),传给 chat.completions 的 tools 参数
+class WebSearchArgs(BaseModel):
+    """web_search 工具参数 schema:客户端强校验与 WEB_SEARCH_TOOL.parameters 的单一来源.
+
+    模型生成的 tool_calls 参数经 model_validate_json 强校验(见 agents/outliner.py),
+    WEB_SEARCH_TOOL.parameters 由 model_json_schema() 导出, 两侧永不漂移.
+    """
+
+    query: str = Field(min_length=1, max_length=200, description="要搜索的中文关键词或短语")
+
+
+# 工具定义(OpenAI 兼容的 function schema),传给 chat.completions 的 tools 参数.
+# parameters 从 WebSearchArgs.model_json_schema() 导出:minLength/maxLength 约束对模型可见
 WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
         "description": "在互联网上搜索给定关键词，返回相关网页的标题、链接与摘要，用于收集写文章所需的真实素材。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "要搜索的中文关键词或短语",
-                }
-            },
-            "required": ["query"],
-        },
+        "parameters": WebSearchArgs.model_json_schema(),
     },
 }

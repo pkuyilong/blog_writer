@@ -14,6 +14,7 @@ prompts.py 用 model_json_schema() 导出文本嵌进 prompt 做强约束, 这�
 强校验, 两侧永不漂移.
 """
 
+import json
 import logging
 from typing import Callable, TypeVar
 
@@ -39,6 +40,8 @@ _TYPE_HINTS = {
     "model_type": "应为 json 对象",
     "greater_than_equal": "数值过小（低于允许下限）",
     "less_than_equal": "数值过大（高于允许上限）",
+    "string_too_short": "长度过短（query 不能为空或太短）",
+    "string_too_long": "长度过长（超出允许上限）",
 }
 
 
@@ -92,6 +95,29 @@ def _format_validation_errors(exc: ValidationError, limit: int = 10) -> list[str
     if len(errs) > limit:
         lines.append(f"- ……（共 {len(errs)} 处问题，请先修复以上 {limit} 处）")
     return lines
+
+
+def format_tool_arg_errors(arguments: str, exc: ValidationError) -> str:
+    """把工具参数校验错误格式化成「字段 + 期望 + 实际值」的中文行, 供作为 tool 消息反馈给模型.
+
+    与 _format_validation_errors 的区别:额外解析原始 arguments 把字段的**实际值**带上
+    (满足"哪个字段/期望什么/实际给了什么");非法 JSON 时取不到实际值, 只提示根对象.
+    """
+    try:
+        actual = json.loads(arguments)
+    except Exception:
+        actual = None
+    lines = []
+    for err in exc.errors()[:5]:
+        loc = ".".join(str(x) for x in err["loc"]) or "根对象"
+        hint = _TYPE_HINTS.get(err["type"], err["type"])
+        got = ""
+        if isinstance(actual, dict):
+            key = err["loc"][0] if err["loc"] else None
+            if key is not None and key in actual:
+                got = f"（实际收到：{json.dumps(actual[key], ensure_ascii=False)}）"
+        lines.append(f"- {loc}: {hint}{got}")
+    return "\n".join(lines)
 
 
 def _build_retry_content(base: str, error_lines: list[str], prefix: str) -> str:

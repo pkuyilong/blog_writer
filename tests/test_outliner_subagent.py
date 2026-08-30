@@ -57,6 +57,15 @@ def make_tc(tc_id, query):
     )
 
 
+def make_tc_raw(tc_id, args):
+    """构造带原始 arguments 的 tool_call:args 为 dict(自动 json 编码)或字符串(测非法 JSON)."""
+    arguments = args if isinstance(args, str) else json.dumps(args)
+    return SimpleNamespace(
+        id=tc_id,
+        function=SimpleNamespace(name="web_search", arguments=arguments),
+    )
+
+
 def make_resp(msg):
     return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
@@ -73,7 +82,12 @@ def setup(cfg):
     def fake_chat(system, messages, tools=None, **kw):
         calls["chat"] += 1
         calls["chat_messages"].append(messages)
-        if tools:  # 搜索阶段:一次返回 n_queries 个查询
+        if tools:  # 搜索阶段
+            tc_seq = cfg.get("tool_calls_seq")
+            if tc_seq:  # 显式指定工具调用批次(测参数校验重试),逐批弹出
+                specs = tc_seq.pop(0)
+                return make_resp(make_msg("", [make_tc_raw(tc_id, args) for tc_id, args in specs]))
+            # 默认:一次返回 n_queries 个合法查询
             return make_resp(
                 make_msg("", [make_tc(f"t{calls['chat']}_{i}", f"查询{i}") for i in range(n_queries)])
             )
@@ -191,6 +205,69 @@ check("H: 3 个查询并行执行（search=3）", calls["search"] == 3, f"search
 check("H: 并行后 chat 仍按 搜索/审查/生成 3 次收敛", calls["chat"] == 3, f"chat={calls['chat']}")
 check("H: 并行搜索后返回可用大纲", O._usable(out["outline"]))
 check("H: 并行搜索结果落入 materials", O._materials_ok(out.get("materials", "")), f"len={len(out.get('materials', ''))}")
+print()
+
+# ---- 场景 I:工具参数强校验 + 校验失败反馈重试(WebSearchArgs) ----
+# I1:非法类型(query=123)→ 反馈具体错误(字段+期望+实际值)→ 重试轮合法 → 收敛
+calls = setup({
+    "review_texts": [MATERIALS],
+    "outline_seq": [GOOD_OUTLINE],
+    "tool_calls_seq": [
+        [("bad1", {"query": 123})],
+        [("t1", {"query": "查询0"})],
+    ],
+})
+out = O.build_outliner().invoke({"topic": "多智能体"})
+check("I1: 参数非法触发反馈重试(搜索 chat 2 次:首轮非法+重试轮)", calls["chat"] == 4,
+      f"chat={calls['chat']}")
+check("I1: 非法参数未执行搜索, 重试轮合法查询执行 1 次", calls["search"] == 1,
+      f"search={calls['search']}")
+i1_all = "\n".join(str(m) for m in calls["chat_messages"][1])  # 重试轮收到的 messages 含首轮反馈
+check("I1: 反馈含字段名 query", "query" in i1_all)
+check("I1: 反馈含期望类型(应为字符串)", "应为字符串" in i1_all)
+check("I1: 反馈含实际值(实际收到：123)", "实际收到：123" in i1_all)
+check("I1: 反馈后带修正提示(未通过 json 结构校验)", "未通过 json 结构校验" in i1_all)
+check("I1: 返回可用大纲", O._usable(out["outline"]))
+print()
+
+# I2:非法 JSON(非 json 文本)→ 反馈"不是合法 json" → 重试轮合法 → 收敛
+calls = setup({
+    "review_texts": [MATERIALS],
+    "outline_seq": [GOOD_OUTLINE],
+    "tool_calls_seq": [
+        [("bad2", "not json")],
+        [("t2", {"query": "查询0"})],
+    ],
+})
+out = O.build_outliner().invoke({"topic": "多智能体"})
+check("I2: 非法 JSON 触发反馈重试", calls["chat"] == 4, f"chat={calls['chat']}")
+check("I2: 重试轮执行 1 次搜索", calls["search"] == 1, f"search={calls['search']}")
+i2_all = "\n".join(str(m) for m in calls["chat_messages"][1])
+check("I2: 反馈含不是合法的 json 文本", "不是合法的 json 文本" in i2_all)
+check("I2: 返回可用大纲", O._usable(out["outline"]))
+print()
+
+# I3:重试耗尽(3 轮均含非法)→ 跳过非法调用, 只执行每轮合法子集, 不崩溃
+calls = setup({
+    "review_texts": [MATERIALS],
+    "outline_seq": [GOOD_OUTLINE],
+    "tool_calls_seq": [
+        [("bad3", {"query": 123}), ("ok3a", {"query": "查询A"})],
+        [("bad4", {"query": 456}), ("ok3b", {"query": "查询B"})],
+        [("bad5", {"query": 789}), ("ok3c", {"query": "查询C"})],
+    ],
+})
+out = O.build_outliner().invoke({"topic": "多智能体"})
+check("I3: 3 轮非法后耗尽(搜索 chat 3 次 + 审查 + 生成)", calls["chat"] == 5, f"chat={calls['chat']}")
+check("I3: 只执行每轮合法子集(3 条, 非法从未执行)", calls["search"] == 3, f"search={calls['search']}")
+check("I3: 不崩溃且返回可用大纲", O._usable(out["outline"]))
+print()
+
+# I4:_run_search 防御性校验(非法参数返回错误文本而非抛 JSONDecodeError)
+calls = setup({"review_texts": [MATERIALS], "outline_seq": [GOOD_OUTLINE]})
+tc_id, content = O._run_search(make_tc_raw("x", "not json"))
+check("I4: _run_search 对非法参数不抛异常", tc_id == "x")
+check("I4: 返回参数校验失败文本", "工具参数校验失败" in content and "不是合法的 json 文本" in content)
 print()
 
 failed = [p for p in passed if not p[1]]

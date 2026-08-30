@@ -24,6 +24,7 @@
 - 🧩 **大纲子智能体**（自包含独立子图）：检索、生成、保障一体——内部 搜索 → 审查素材 → 生成提纲 → 自检；素材不足会**自动补搜**、提纲不合格会重试，最终保证返回可用的提纲
 - ⚡ **并行搜索**：一轮提出 3-5 个聚焦查询，**并发**执行搜索，节省时间、覆盖更多关键词
 - 🔍 通过 `web_search` 工具（DuckDuckGo，免费无需 Key）联网搜索真实资料，素材带来源链接
+- 🛡️ **工具参数强校验**：模型生成的搜索参数先经 schema 强校验——非法参数不会让流程崩溃、也不会被静默丢弃，而是把具体错误反馈给模型重新生成，保证搜索照常执行
 - 🧐 **检索内容审查**：搜索结果先交给 LLM 审查（来源可信度 / 信息含量 / 相关度），剔除营销味、宽泛无信息、脏数据内容，再基于可靠素材生成提纲
 - 🎯 **科普定位**：写作要求生活化类比、术语先解释、通俗但有深度；内容以真实素材为准
 - ✍️ **按章节并发写作**：提纲拆成 5-7 个章节，各章节**并行**写作后按序合并成全文，生成更快
@@ -67,8 +68,8 @@ blog_writer/
 ├── .env.example            # 环境变量模板（复制为 .env 填写 Key）
 ├── agents/
 │   ├── __init__.py
-│   ├── tools.py            # web_search 联网搜索工具（DuckDuckGo，region=cn-zh + 标题清洗）
-│   ├── outliner.py         # 大纲子智能体（自包含子图：搜索→审查→生成→自检→补搜/重试→兜底）
+│   ├── tools.py            # web_search 联网搜索工具（DuckDuckGo，region=cn-zh + 标题清洗；WebSearchArgs 工具参数 schema）
+│   ├── outliner.py         # 大纲子智能体（自包含子图：搜索→审查→生成→自检→补搜/重试→兜底；搜索参数强校验+失败反馈重试）
 │   ├── human_review.py     # 人工介入节点：interrupt() 暂停 + Command(resume) 续跑（--human-review）
 │   ├── writing.py          # 写作子 Agent（自包含子图：拆章 split / Send 分发 fan_out / 合并 merge）
 │   ├── section_writer.py   # 章节写作子智能体（自包含子图：初稿 → 自检 → 条件重写）
@@ -245,7 +246,7 @@ python main.py --clear-search-cache
    `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `writing`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（`interrupt()` 暂停展示大纲）再到 `writing`；用户输入修改意见时经条件边 `route_review` 回 `human_review` 先重写大纲、再二次确认；默认关闭直接到 `writing`，该节点完全不执行。
 
 3. **大纲子智能体（`agents/outliner.py`）**：一个编译好的**自包含子图**，挂到主图的 `outline` 节点，负责"检索 + 生成提纲"一体：
-   - **搜索**：把对话交给模型（带 `web_search` 工具），模型一次提出 3-5 个具体查询，用 `ThreadPoolExecutor` **并发**执行搜索（上限 4）；
+   - **搜索**：把对话交给模型（带 `web_search` 工具），模型一次提出 3-5 个具体查询，用 `ThreadPoolExecutor` **并发**执行搜索（上限 4）；模型生成的搜索参数会先经 schema 强校验——非法参数不会崩溃或静默丢弃，而是把**具体字段错误**（字段 + 期望 + 实际值）反馈给模型重新生成（最多 2 次），仍非法则跳过该条、只执行合法查询；
    - **审查**：用 `MATERIAL_REVIEW_PROMPT` 让 LLM 逐条审查搜索结果，剔除营销味、宽泛无信息、与主题无关、明显拼接的脏数据，整理出可靠素材；
    - **生成 + 自检**：基于素材生成提纲并自检（非空且不低于最低长度）；
    - **失败分类路由**：素材不足（搜索失败/审查太差）→ 补搜（≤2 轮）；提纲不合格 → 换提示重试（≤2 次）；都到上限 → 基于自身知识兜底。**保证最终一定返回可用的 outline**。
@@ -261,6 +262,13 @@ python main.py --clear-search-cache
 ## 重大改动记录
 
 以下是项目演进过程中的关键改动，便于回顾每次变更的目的。
+
+### v2.7 — 工具调用参数强校验 + 校验失败反馈重试
+
+- **新增 `WebSearchArgs`（`agents/tools.py`）**：搜索工具参数 schema 有了单一来源，`WEB_SEARCH_TOOL.parameters` 改由 `model_json_schema()` 导出（`minLength`/`maxLength` 长度约束对模型可见）——发给模型的 schema 与客户端强校验永不漂移。
+- **搜索参数强校验 + 失败反馈重试（`agents/outliner.py`）**：模型生成的搜索参数逐条经 pydantic 强校验——合法调用立即**并行执行**；非法调用不再让流程崩溃（此前非法 JSON 直接抛错）或静默丢弃（此前缺字段拿空串、类型错如 `{"query": 123}` 原样传给搜索引擎），而是把**具体字段错误**（字段路径 + 期望类型 + 实际收到的值）作为 tool 消息反馈给模型**重新生成**（最多 2 次）；仍非法则跳过该条、只执行累积的合法子集，绝不中断搜索。
+- **新增 `format_tool_arg_errors()`（`output_validation.py`）**：把工具参数校验错误格式化成「字段 + 期望 + 实际值」的中文行（如 `query: 应为字符串（实际收到：123）`），作为反馈喂回模型修正；`_TYPE_HINTS` 补 `string_too_short`/`string_too_long`。
+- **测试覆盖**：`tests/test_outliner_subagent.py` 新增场景 I 系列（I1 非法类型→反馈重试收敛 / I2 非法 JSON / I3 耗尽跳过非法只执行合法子集 / I4 `_run_search` 防御性校验），全部 10 个测试脚本通过。
 
 ### v2.6 — Web 页面版：选项控制 + 人工干预 + 结果展示
 
