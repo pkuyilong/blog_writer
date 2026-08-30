@@ -3,7 +3,7 @@
 mock R.call_llm(fake 按 kw["role"] 区分角色),不耗 token.覆盖:
   R1 三角色各调一次全通过 / R2 多数不过(合并失败章节,角色前缀)
   R3 多数通过(2 过 1 不过) / R4 分数平均(含四舍五入)
-  R5 单角色解析失败重试(第二次带"不是合法 json"提示)
+  R5 单角色校验失败重试(第二次带具体字段校验反馈)
   R7 弃权不拉偏(a 2 过+1 弃权 / b 1 过+1 不过+1 弃权 / c 全弃权保守通过)
   R8 revision_count 只 +1 / R9 output_schema 不泄漏 / R10 角色顺序契约
 
@@ -146,8 +146,8 @@ out, _, _ = run_case({
 check("R5 总调用 4 次", len(calls["list"]) == 4, f"{len(calls['list'])}")
 lang_calls = [c for c in calls["list"] if c["role"] == "edit_lang"]
 check("R5 edit_lang 调 2 次", len(lang_calls) == 2, f"{len(lang_calls)}")
-check("R5 第二次 user_content 含\"不是合法 json\"",
-      "不是合法 json" in lang_calls[1]["user_content"], "")
+check("R5 第二次 user_content 含具体字段校验反馈",
+      "没有通过 json 结构校验" in lang_calls[1]["user_content"], "")
 check("R5 passed=True", out["passed"] is True, f"{out['passed']}")
 check("R5 revision_count==1", out["revision_count"] == 1, f"{out['revision_count']}")
 
@@ -203,7 +203,7 @@ check("R10 REVIEW_ROLE_NAMES 固定顺序",
       R.REVIEW_ROLE_NAMES == ("edit_lang", "edit_logic", "edit_fact"),
       f"{R.REVIEW_ROLE_NAMES}")
 
-# ===== R11 非 dict 输出防御(_parse_review_output 归一 ValueError,修复前击穿整图) =====
+# ===== R11 非法输出防御(pydantic 强校验失败 → 反馈重试 → 耗尽弃权,不击穿整图) =====
 # R11a: 角色输出 JSON 数组(如 [{"score": 60}]) → 解析失败重试 2 次 → 弃权,不崩溃
 out, _, _ = run_case({
     "edit_lang": [json.dumps([{"score": 60}])],

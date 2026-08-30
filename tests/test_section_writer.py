@@ -4,6 +4,7 @@ mock 所有 LLM(outliner.chat / writer.call_llm / section_writer.call_llm / revi
 不耗 token.覆盖:outline 产出 → split 拆章 → 并行写 N 章(每章是自包含子图,首写即合格,
 省掉旧版无条件反思轮)→ merge → 审核子智能体首轮不过(三角色并行,多数表决 1 过 2 不过)
 → 打回只重写问题章节(带合并后的角色意见)→ 重写后再审全过通过.
+额外覆盖 split 输出校验失败:输出不合法 → 带具体字段错误反馈重试 → 耗尽量回退单章节.
 """
 import json
 import os
@@ -205,6 +206,40 @@ for key in ("write_attempt", "section_text", "self_check_notes", "section", "fee
 # 出现小写 json 才生效;原版只有大写 JSON,本次修复补上,防回归)
 check("SPLIT_PROMPT 含小写 json（DeepSeek json_object 模式要求）",
       "json" in prompts.SPLIT_PROMPT, f"prompts.SPLIT_PROMPT 无小写 json")
+
+# ===== split 输出校验失败 → 带具体字段错误反馈重试 → 耗尽量回退单章节 =====
+OUTLINE_INPUT = {"topic": "远程办公", "outline": OUTLINE, "revision_count": 0}
+
+# 场景 A: 第一次输出不合法(非法 JSON) → 反馈重试 → 第二次合法 → 成功
+split_retry = {"n": 0, "user_contents": []}
+def fake_split_retry(system, user_content, json_mode=False, **kw):
+    if system == W.SPLIT_PROMPT:
+        split_retry["n"] += 1
+        split_retry["user_contents"].append(user_content)
+        return "not json" if split_retry["n"] == 1 else json.dumps(SECTIONS, ensure_ascii=False)
+    raise AssertionError(f"未知 writer system: {system[:30]}")
+W.call_llm = fake_split_retry
+out = W.split_sections(OUTLINE_INPUT)
+check("split重试: 不合法→重试成功, 调 2 次", split_retry["n"] == 2, f"n={split_retry['n']}")
+check("split重试: 第二次 user_content 含具体校验反馈",
+      "没有通过 json 结构校验" in split_retry["user_contents"][1], "")
+check("split重试: 成功后 3 章节并补 id",
+      len(out["sections"]) == 3 and out["sections"][0]["id"] == 0 and "title" in out["sections"][0],
+      f"n={len(out['sections'])}")
+
+# 场景 B: 两次都输出不合法 → 耗尽回退单章节(原兜底保留)
+split_bad = {"n": 0}
+def fake_split_bad(system, user_content, json_mode=False, **kw):
+    if system == W.SPLIT_PROMPT:
+        split_bad["n"] += 1
+        return "not json"
+    raise AssertionError(f"未知 writer system: {system[:30]}")
+W.call_llm = fake_split_bad
+out = W.split_sections(OUTLINE_INPUT)
+check("split回退: 两次失败后回退单章节", split_bad["n"] == 2 and len(out["sections"]) == 1,
+      f"n={split_bad['n']} sections={len(out['sections'])}")
+check("split回退: 单章节 title==topic 且 id==0",
+      out["sections"][0]["title"] == "远程办公" and out["sections"][0]["id"] == 0, "")
 
 print()
 failed = [p for p in passed if not p[1]]

@@ -117,7 +117,7 @@ def write(state: SectionWriterState) -> dict:
     if state.get("feedback"):
         user_content += f"\n\n【上轮审校意见】{state['feedback']}\n请逐条针对意见修改本章节。"
 
-    text = call_llm(prompt, user_content, role="write")
+    text = call_llm(prompt, user_content, role="write", json_mode=False)  # 正文是 Markdown 输出,显式关闭 json 模式
     return {"section_text": text, "write_attempt": attempt}
 
 

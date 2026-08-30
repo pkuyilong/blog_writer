@@ -301,7 +301,7 @@ python main.py --clear-search-cache
 
 ### v2.1 — 写作/审校升级为真正 Agent：章节子智能体 + 审校重试
 
-- **`write_section` 升级为自包含子智能体**（新增 `agents/section_writer.py`）：每个章节独立完成"初稿 → 自检 → 条件重写"。自检用**启发式**（篇幅 ≥ 120 字 / 以 `## ` 开头 / 覆盖要点），不调 LLM、确定性可测——**合格直接通过，省掉旧版"无条件自我反思一轮"的调用**；不合格且未到上限才重写（自检意见作为反馈塞回生成提示），达上限接受当前结果。
+- **`write_section` 升级为自包含子智能体**（新增 `agents/section_writer.py`）：每个章节独立完成"初稿 → 自检 → 条件重写"。自检用**启发式**（篇幅 ≥ 120 字 / 以 `## ` 开头），不调 LLM、确定性可测——**合格直接通过，省掉旧版"无条件自我反思一轮"的调用**；不合格且未到上限才重写（自检意见作为反馈塞回生成提示），达上限接受当前结果。
 - **审校解析失败重试**：`editor_node` 的 JSON 解析从"失败即保守通过"改为"**重试最多 2 次**（提示附'不是合法 JSON'），耗尽才保守通过"；`revision_count` 不因重试多计。
 - **踩过的坑（langgraph 1.2.11）**：Send 并行触发编译子图时，子图若把输入键（如 `topic`）原样写回父图会抛 `INVALID_CONCURRENT_GRAPH_UPDATE`——用 `output_schema` 限定子图只输出 `section_drafts` 根除；子图内部草稿键绝不能命名 `draft`（会覆盖父图合并结果），一律用 `section_text`。
 
@@ -364,7 +364,7 @@ python main.py --clear-search-cache
 ### v1.0 — 收敛与可观测性
 
 - **调研收敛**：ReAct 循环改为两阶段（一次搜索 → 强制收敛出提纲），消除"搜索轮次用尽"反复搜索、浪费 token 的问题。
-- **LangSmith 集成**：新增 `langsmith_config.py`、`.env.example`、`LANGSMITH.md`；`llm.py` 用 `@traceable` 上报每次 LLM 调用，可在 smith.langchain.com 查看完整执行追踪。
+- **LangSmith 集成**：新增 `langsmith_config.py`、`.env.example`；`llm.py` 用 `@traceable` 上报每次 LLM 调用，可在 smith.langchain.com 查看完整执行追踪。
 - **去 AI 味**：重写写作/审校 prompt，禁用套话与模板结构，要求长短句交错、具体数据落地。
 
 ## 待办事项

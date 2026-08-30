@@ -11,6 +11,9 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -275,7 +278,239 @@ check("T9 懒加载: 相同 (base_url, env) 只构造一次 client", count["n"] 
 check("T9 缓存: 两次返回同一实例", c1 is c2, "")
 restore(S)
 
+# ===== T10 限流退避重试成功(同模型, 不切) =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+
+
+def _rl_err(retry_after=None):
+    """构造真实的 openai.RateLimitError(带可选 retry-after 响应头)."""
+    req = httpx.Request("POST", "https://fake.local/chat/completions")
+    hdrs = {"retry-after": retry_after} if retry_after is not None else {}
+    resp = httpx.Response(429, headers=hdrs, request=req)
+    return openai.RateLimitError(
+        "429 Too Many Requests", response=resp, body={"error": {"code": "rate_limit_error"}}
+    )
+
+
+def fake_rl_spec_ok(spec):
+    n = getattr(fake_rl_spec_ok, "n", 0)
+    fake_rl_spec_ok.n = n + 1
+    if n == 0:
+        raise _rl_err()
+    return fake_client_result("限流退避后成功")
+
+
+MR.ROLE_MODEL_MAP["edit_lang"] = ["m1"]
+llm.get_client = fake_rl_spec_ok
+with patch("model_router.time") as m:
+    out = llm.call_llm("sys", "user", role="edit_lang")
+check("T10 限流退避重试后成功", out == "限流退避后成功", f"out={out!r}")
+check("T10 限流同模型调 2 次", fake_rl_spec_ok.n == 2, f"n={fake_rl_spec_ok.n}")
+check("T10 限流退避 sleep 1 次", m.sleep.call_count == 1, f"sleep={m.sleep.call_count}")
+restore(S)
+
+# ===== T11 限流优先采用服务端 retry-after 头 =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+
+
+def fake_rl_ra(spec):
+    n = getattr(fake_rl_ra, "n", 0)
+    fake_rl_ra.n = n + 1
+    if n == 0:
+        raise _rl_err(retry_after="3")
+    return fake_client_result("ok")
+
+
+MR.ROLE_MODEL_MAP["edit_lang"] = ["m1"]
+llm.get_client = fake_rl_ra
+with patch("model_router.time") as m:
+    llm.call_llm("sys", "user", role="edit_lang")
+d = m.sleep.call_args[0][0]
+check("T11 限流退避采用 retry-after 头", d == 3.0, f"delay={d}")
+restore(S)
+
+# ===== T12 瞬时(超时)退避重试成功 =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+
+
+def fake_to_ok(spec):
+    n = getattr(fake_to_ok, "n", 0)
+    fake_to_ok.n = n + 1
+    if n == 0:
+        req = httpx.Request("POST", "https://fake.local/chat/completions")
+        raise openai.APITimeoutError(request=req)
+    return fake_client_result("超时重试后成功")
+
+
+MR.ROLE_MODEL_MAP["edit_lang"] = ["m1"]
+llm.get_client = fake_to_ok
+with patch("model_router.time") as m:
+    out = llm.call_llm("sys", "user", role="edit_lang")
+check("T12 超时退避重试后成功", out == "超时重试后成功", f"out={out!r}")
+check("T12 超时调 2 次", fake_to_ok.n == 2, f"n={fake_to_ok.n}")
+check("T12 超时 sleep 1 次", m.sleep.call_count == 1, f"sleep={m.sleep.call_count}")
+restore(S)
+
+# ===== T13 瞬时重试耗尽后切下一个模型, 仍失败抛错 =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+MR.MODEL_REGISTRY["m2"] = new_spec("m2", caps={"json"})
+
+
+def fake_to_dead(spec):
+    n = getattr(fake_to_dead, "n", 0)
+    fake_to_dead.n = n + 1
+    req = httpx.Request("POST", "https://fake.local/chat/completions")
+    raise openai.APITimeoutError(request=req)
+
+
+MR.ROLE_MODEL_MAP["edit_lang"] = ["m1", "m2"]
+llm.get_client = fake_to_dead
+with patch("model_router.time") as m:
+    try:
+        llm.call_llm("sys", "user", role="edit_lang")
+        check("T13 两模型瞬时全失败抛 ModelRoutingError", False)
+    except MR.ModelRoutingError:
+        check("T13 两模型瞬时全失败抛 ModelRoutingError", True)
+check("T13 总调用 = 2 模型 × 3 次", fake_to_dead.n == 6, f"n={fake_to_dead.n}")
+check("T13 sleep = 2 模型 × 2 重试", m.sleep.call_count == 4, f"sleep={m.sleep.call_count}")
+restore(S)
+
+# ===== T14 致命错误不重试, 直接切下一个模型 =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+MR.MODEL_REGISTRY["m2"] = new_spec("m2", caps={"json"})
+
+
+def fake_fatal(spec):
+    n = getattr(fake_fatal, "n", 0)
+    fake_fatal.n = n + 1
+    if spec.name == "m1":
+        req = httpx.Request("POST", "https://fake.local/chat/completions")
+        resp = httpx.Response(401, request=req)
+        raise openai.AuthenticationError("invalid key", response=resp, body={"error": {}})
+    return fake_client_result("第二个模型成功")
+
+
+MR.ROLE_MODEL_MAP["edit_lang"] = ["m1", "m2"]
+llm.get_client = fake_fatal
+with patch("model_router.time") as m:
+    out = llm.call_llm("sys", "user", role="edit_lang")
+check("T14 致命错误不重试直接切下一个", out == "第二个模型成功", f"out={out!r}")
+check("T14 致命错误只调 2 次(无重试)", fake_fatal.n == 2, f"n={fake_fatal.n}")
+check("T14 致命错误不 sleep", m.sleep.call_count == 0, f"sleep={m.sleep.call_count}")
+restore(S)
+
+def _ctx_err():
+    """构造真实的 context_length_exceeded BadRequestError."""
+    req = httpx.Request("POST", "https://fake.local/chat/completions")
+    resp = httpx.Response(400, request=req)
+    body = {
+        "error": {
+            "code": "context_length_exceeded",
+            "message": "This model's maximum context length is 64000 tokens",
+        }
+    }
+    return openai.BadRequestError("400 context length exceeded", response=resp, body=body)
+
+
+def _other400():
+    """构造一个无法自动编辑的普通 400 参数错误."""
+    req = httpx.Request("POST", "https://fake.local/chat/completions")
+    resp = httpx.Response(400, request=req)
+    body = {"error": {"code": "invalid_request_error", "message": "bad param"}}
+    return openai.BadRequestError("400", response=resp, body=body)
+
+
+# ===== T15 失败原因分类 _classify_llm_error =====
+_req = httpx.Request("POST", "https://fake.local/chat/completions")
+_resp500 = httpx.Response(500, request=_req)
+check("T15 RateLimitError=rate_limit", MR._classify_llm_error(_rl_err()) == "rate_limit", "")
+check("T15 APITimeoutError=transient", MR._classify_llm_error(openai.APITimeoutError(request=_req)) == "transient", "")
+check("T15 APIConnectionError=transient", MR._classify_llm_error(openai.APIConnectionError(request=_req)) == "transient", "")
+check("T15 InternalServerError=transient", MR._classify_llm_error(openai.InternalServerError("500", response=_resp500, body={})) == "transient", "")
+check("T15 认证错误=fatal", MR._classify_llm_error(openai.AuthenticationError("401", response=httpx.Response(401, request=_req), body={})) == "fatal", "")
+check("T15 未知 OpenAIError=fatal", MR._classify_llm_error(openai.OpenAIError("x")) == "fatal", "")
+check("T15 context_length_exceeded=context_exceeded", MR._classify_llm_error(_ctx_err()) == "context_exceeded", "")
+check("T15 其他 400 参数错误=fatal", MR._classify_llm_error(_other400()) == "fatal", "")
+
+# ===== T16 退避计算 _retry_delay(指数/限流翻倍/封顶/retry-after 优先) =====
+check("T16 瞬时指数退避", MR._retry_delay(1, "transient") == 1.0 and MR._retry_delay(2, "transient") == 2.0, "")
+check("T16 限流退避翻倍", MR._retry_delay(1, "rate_limit") == 2.0, "")
+check("T16 封顶 RETRY_MAX_DELAY", MR._retry_delay(5, "rate_limit") == MR.RETRY_MAX_DELAY, "")
+check("T16 限流 retry-after 优先", MR._retry_delay(1, "rate_limit", exc=_rl_err(retry_after="3")) == 3.0, "")
+check("T16 瞬时忽略 retry-after", MR._retry_delay(1, "transient", exc=_rl_err(retry_after="3")) == 1.0, "")
 print()
+
+# ===== T17 context_length_exceeded → 按失败信息缩小 max_tokens 重试成功 =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+
+
+def fake_recording(seen):
+    """记录每次 create 实际收到的 max_tokens."""
+    def create(**kw):
+        seen.append(kw.get("max_tokens"))
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="缩小后成功"))])
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def fake_ctx_ok(spec):
+    n = getattr(fake_ctx_ok, "n", 0)
+    fake_ctx_ok.n = n + 1
+    if n == 0:
+        raise _ctx_err()
+    return fake_recording(seen)
+
+
+seen = []
+MR.ROLE_MODEL_MAP["edit_lang"] = ["m1"]
+llm.get_client = fake_ctx_ok
+with patch("model_router.time") as m:
+    out = llm.call_llm("sys", "user", role="edit_lang")  # 默认 max_tokens=16000
+check("T17 context 超长缩小 max_tokens 重试成功", out == "缩小后成功", f"out={out!r}")
+check("T17 同模型调 2 次", fake_ctx_ok.n == 2, f"n={fake_ctx_ok.n}")
+check("T17 第二次 max_tokens 减半为 8000", seen == [8000], f"seen={seen}")
+check("T17 参数编辑重试不退避", m.sleep.call_count == 0, f"sleep={m.sleep.call_count}")
+restore(S)
+
+# ===== T18 context 超长缩到最小仍超 → 切下一个模型 =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+
+
+def fake_ctx_dead(spec):
+    raise _ctx_err()
+
+
+adjust = {"max_tokens": 16000}
+with patch("model_router.time") as m:
+    try:
+        MR.call_with_fallback([MR.MODEL_REGISTRY["m1"]], fake_ctx_dead, adjust=adjust)
+        check("T18 缩到最小仍超抛 ModelRoutingError", False)
+    except MR.ModelRoutingError:
+        check("T18 缩到最小仍超抛 ModelRoutingError", True)
+check("T18 缩小 2 次后 max_tokens=4000", adjust["max_tokens"] == 4000, f"adjust={adjust}")
+check("T18 参数编辑重试不退避", m.sleep.call_count == 0, f"sleep={m.sleep.call_count}")
+restore(S)
+
+# ===== T19 其他 400 参数错误无法自动编辑 → fatal 直接切下一个模型 =====
+MR.MODEL_REGISTRY["m1"] = new_spec("m1", caps={"json"})
+MR.MODEL_REGISTRY["m2"] = new_spec("m2", caps={"json"})
+
+
+def fake_other400(spec):
+    n = getattr(fake_other400, "n", 0)
+    fake_other400.n = n + 1
+    if spec.name == "m1":
+        raise _other400()
+    return fake_client_result("第二个模型成功")
+
+
+MR.ROLE_MODEL_MAP["edit_lang"] = ["m1", "m2"]
+llm.get_client = fake_other400
+with patch("model_router.time") as m:
+    out = llm.call_llm("sys", "user", role="edit_lang")
+check("T19 其他 400 参数错误=fatal 切下一个", out == "第二个模型成功", f"out={out!r}")
+check("T19 不缩 max_tokens 只调 2 次", fake_other400.n == 2, f"n={fake_other400.n}")
+restore(S)
+
 failed = [p for p in passed if not p[1]]
 print(f"共 {len(passed)} 项检查，通过 {len(passed) - len(failed)} 项")
 sys.exit(1 if failed else 0)

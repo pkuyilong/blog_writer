@@ -60,7 +60,7 @@ def setup_langsmith(project_name: str | None = None) -> None:
 
     if not tracing:
         logger.warning("⚠ LangSmith 未启用：请设置 LANGCHAIN_TRACING_V2=true")
-        logger.warning("   最简单的方式：复制 .env.example 为 .env 并填写（详见 LANGSMITH.md）")
+        logger.warning("   最简单的方式：复制 .env.example 为 .env 并填写")
         return
     if not api_key:
         logger.warning("⚠ LangSmith 未启用：请在 .env 或环境变量中设置 LANGCHAIN_API_KEY=lsv2_xxx")
@@ -70,11 +70,3 @@ def setup_langsmith(project_name: str | None = None) -> None:
     project = os.getenv("LANGCHAIN_PROJECT", project_name or "default")
     logger.info(f"✓ LangSmith 追踪已启用：项目 = {project}")
     logger.info("  访问 https://smith.langchain.com 查看追踪数据")
-
-
-def is_langsmith_enabled() -> bool:
-    """检查 LangSmith 是否已启用."""
-    return (
-        os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
-        and os.getenv("LANGCHAIN_API_KEY") is not None
-    )

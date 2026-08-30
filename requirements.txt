@@ -11,5 +11,7 @@ ddgs
 # Web 页面版（web_server.py）服务端框架
 fastapi
 uvicorn[standard]
+# JSON Schema 强约束输出校验（output_validation.py 的 pydantic model；也是 fastapi 传递依赖，直接使用故显式声明）
+pydantic
 # Web 测试（tests/test_web_server.py，TestClient 依赖）
 httpx

@@ -27,13 +27,13 @@ logger = logging.getLogger(__name__)
 
 
 def _revise_outline(topic: str, outline: str, feedback: str) -> str:
-    """按人工修改意见让 LLM 重写大纲(复用 call_llm,非 json 模式)."""
+    """按人工修改意见让 LLM 重写大纲(复用 call_llm,显式 json_mode=False)."""
     user_content = (
         f"文章题目：{topic}\n\n"
         f"【当前提纲】\n{outline}\n\n"
         f"【人工修改意见】\n{feedback}"
     )
-    return call_llm(REVISE_OUTLINE_PROMPT, user_content, role="revise_outline")
+    return call_llm(REVISE_OUTLINE_PROMPT, user_content, role="revise_outline", json_mode=False)
 
 
 def human_review_node(state: ArticleState) -> dict:

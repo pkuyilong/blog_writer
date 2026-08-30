@@ -8,10 +8,14 @@
   自动切下一个,client 懒加载.
 
 调用方式:
-  call_llm(system, user_content, json_mode=True, role="split")
-  chat(system, messages, tools=[...], role="research")
+  call_llm(system, user_content, role="split")              # 默认 json_mode=True
+  call_llm(prompt, user_content, role="write", json_mode=False)  # Markdown 输出显式关闭
+  chat(system, messages, tools=[...], role="research")       # 工具调用,不走 json_mode
   call_llm(system, user_content, model="deepseek-v4-flash")  # 显式指定,跳过路由
 
+**默认启用 json 模式**:call_llm 的 json_mode 默认 True,需要结构化输出的调用
+(审校/拆章经 call_json_model)无需再显式传参;仅输出纯文本/Markdown 的调用
+(写正文、修订大纲)显式传 json_mode=False.
 不传 role/model 时行为与旧版一致:走全局默认模型(main.py --model 可覆盖).
 新参数 model/role 是 keyword-only,放在既有位置参数之后,测试 fake 的 **kw 可吸收.
 """
@@ -24,17 +28,13 @@ from model_router import (
     resolve_chain,
 )
 
-# 兼容别名:旧代码/文档引用 llm.MODEL 时仍可用;真正生效的默认由 model_router 管理
-# (全局默认模型 + main.py --model 覆盖).
-MODEL = "deepseek-v4-flash"
-
 
 @traceable(run_type="llm", name="call_llm")
 def call_llm(
     system: str,
     user_content: str,
     max_tokens: int = 16000,
-    json_mode: bool = False,
+    json_mode: bool = True,
     *,
     model: str | None = None,
     role: str | None = None,
@@ -42,8 +42,8 @@ def call_llm(
     """统一封装一次 LLM 调用,返回模型输出的文本.
 
     DeepSeek 是 OpenAI 兼容格式:system 提示作为 messages 中的一条消息,
-    而不是顶层参数.json_mode=True 时开启 JSON 模式(prompt 中需出现
-    "json" 字样).
+    而不是顶层参数.默认启用 JSON 模式(json_mode=True,prompt 中需出现
+    "json" 字样);仅输出纯文本/Markdown 的调用显式传 json_mode=False.
 
     model/role:见模块 docstring.json_mode=True 时要求模型具备 json 能力
     (role 链里不具备的模型会被静默跳过,显式指定 model 则直接报错).
@@ -53,10 +53,14 @@ def call_llm(
         model=model,
         required_capabilities={"json"} if json_mode else None,
     )
+    # adjust 是可变 dict: context_length_exceeded 时 call_with_fallback 会把
+    # max_tokens 减半再重试(见 model_router._classify_llm_error / call_with_fallback)
+    adjust = {"max_tokens": max_tokens}
     return call_with_fallback(
         specs,
-        lambda spec: _create(spec, system, user_content, max_tokens, json_mode),
+        lambda spec: _create(spec, system, user_content, adjust["max_tokens"], json_mode),
         role=role,
+        adjust=adjust,
     )
 
 
@@ -82,10 +86,12 @@ def chat(
         model=model,
         required_capabilities={"tools"} if tools else None,
     )
+    adjust = {"max_tokens": max_tokens}  # context 超长时自动缩小重试, 见 call_llm
     return call_with_fallback(
         specs,
-        lambda spec: _chat_create(spec, system, messages, tools, max_tokens),
+        lambda spec: _chat_create(spec, system, messages, tools, adjust["max_tokens"]),
         role=role,
+        adjust=adjust,
     )
 
 

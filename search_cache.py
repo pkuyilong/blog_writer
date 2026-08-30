@@ -45,14 +45,12 @@ def _connect() -> sqlite3.Connection:
             CREATE TABLE IF NOT EXISTS search_cache (
                 query TEXT PRIMARY KEY,
                 result TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                hit_count INTEGER NOT NULL DEFAULT 0
+                created_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS topic_materials (
                 topic TEXT PRIMARY KEY,
                 materials TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                hit_count INTEGER NOT NULL DEFAULT 0
+                created_at REAL NOT NULL
             );
             """
         )
@@ -89,11 +87,6 @@ def cached_search(query: str, *, ttl: float = DEFAULT_TTL) -> str:
         if row is not None:
             result, created_at = row
             if not _expired(created_at, ttl):
-                conn.execute(
-                    "UPDATE search_cache SET hit_count = hit_count + 1 WHERE query = ?",
-                    (key,),
-                )
-                conn.commit()
                 return result
             conn.execute("DELETE FROM search_cache WHERE query = ?", (key,))  # 惰性失效
             conn.commit()
@@ -137,10 +130,6 @@ def get_cached_materials(topic: str, *, ttl: float = DEFAULT_TTL) -> str | None:
             conn.execute("DELETE FROM topic_materials WHERE topic = ?", (key,))
             conn.commit()
             return None
-        conn.execute(
-            "UPDATE topic_materials SET hit_count = hit_count + 1 WHERE topic = ?", (key,)
-        )
-        conn.commit()
         return materials
 
 

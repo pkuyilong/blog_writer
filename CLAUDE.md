@@ -69,7 +69,7 @@ writing 子图（agents/writing.py，自包含，挂 writing 节点）：
 
 edit 审核子智能体（agents/review.py，自包含，挂 edit 节点）：
   START →(fan_out_reviewers：Send×3)→ review_role(并行×3) → aggregate(多数表决) → END
-  · review_role：按 role_name 选 prompt，call_llm(json_mode=True, role=edit_xxx)；解析失败重试 REVIEW_MAX_RETRIES 次，耗尽弃权（passed=None，不投通过票）
+  · review_role：按 role_name 选 prompt，call_llm(json_mode=True, role=edit_xxx)；pydantic 校验失败重试 REVIEW_MAX_RETRIES 次，耗尽弃权（passed=None，不投通过票）
   · role_reviews：私有 reducer 聚合键（role_name → {score, passed, failed_sections}），Send 并行实例只写它
   · aggregate：显式通过票 ≥2（len(REVIEW_ROLE_NAMES)//2+1）才算通过；quality_score=有效票 score 均值；failed_sections 按 id 合并（【角色名】前缀拼接，passed 时 []）；final_article=当前 draft（取消润色）；revision_count 只在此 +1
   · output_schema 只写回 {final_article, quality_score, passed, failed_sections, revision_count}：与旧 editor 输出键一致，主图 should_continue / writing 打回链路零改动
@@ -88,15 +88,16 @@ outline 子图（agents/outliner.py，自包含）：
 | `main.py` | CLI 入口：解析参数/装配 checkpointer（SqliteSaver 或 --in-memory 的 MemorySaver）/统一交互循环（处理 `__interrupt__` 与 `Command(resume=...)`）/`--resume` 断点续跑/打印成品 |
 | `graph.py` | 主图编排：`outline → writing → edit`，`should_continue` 决定打回 `writing`（只重写问题章节） |
 | `state.py` | `ArticleState`（TypedDict）：主图共享状态，**不含 materials**（素材只在子图内部流动）；`section_drafts` 用 `Annotated[dict, reducer]` 聚合并行章节草稿 |
-| `llm.py` | LLM 调用统一封装（消息形状 + `@traceable`）：`call_llm()`（一次性问答，可选 JSON 模式）/ `chat()`（返回完整响应以便读 `tool_calls`）；新增 keyword-only 的 `model`/`role` 参数，委托 model_router 选模型与兜底 |
-| `model_router.py` | **多模型路由**：`ModelSpec` 注册表（MODEL_REGISTRY）+ `ROLE_MODEL_MAP`（role→候选模型链，`__default__` 哨兵跟随全局默认）+ `resolve_chain()`（显式 model > role 链 > 全局默认，能力过滤）+ `call_with_fallback()`（失败切下一个模型）+ `get_client()`（按 provider 懒加载缓存）；`ModelRoutingError` |
-| `prompts.py` | 各 Agent 中文 system prompt：RESEARCHER / MATERIAL_REVIEW / OUTLINER / FALLBACK_OUTLINE / REVISE_OUTLINE / SPLIT / WRITE_SECTION / REVIEW_LANG / REVIEW_LOGIC / REVIEW_FACT（含共享 `_REVIEW_JSON_SCHEMA`） |
-| `agents/tools.py` | `web_search()` + `WEB_SEARCH_TOOL`（OpenAI 兼容 function schema） |
+| `llm.py` | LLM 调用统一封装（消息形状 + `@traceable`）：`call_llm()`（一次性问答，**默认 JSON 模式**，仅 Markdown 输出显式关）/ `chat()`（返回完整响应以便读 `tool_calls`）；新增 keyword-only 的 `model`/`role` 参数，委托 model_router 选模型与兜底 |
+| `model_router.py` | **多模型路由**：`ModelSpec` 注册表（MODEL_REGISTRY）+ `ROLE_MODEL_MAP`（role→候选模型链，`__default__` 哨兵跟随全局默认）+ `resolve_chain()`（显式 model > role 链 > 全局默认，能力过滤）+ `call_with_fallback()`（失败按原因分类退避重试、耗尽切下一个模型）+ `get_client()`（按 provider 懒加载缓存）；`ModelRoutingError` |
+| `output_validation.py` | **LLM JSON 输出强约束**：`call_json_model()`（json_mode LLM + pydantic 强校验，校验失败把**结构化字段错误**（字段路径+原因）反馈给模型重试、耗尽返回 None）+ 输出 pydantic model（`ReviewOutput`/`SplitOutput`，`model_json_schema()` 导出文本嵌入 prompts，客户端与 prompt 用同一 schema 不漂移） |
+| `prompts.py` | 各 Agent 中文 system prompt：RESEARCHER / MATERIAL_REVIEW / OUTLINER / FALLBACK_OUTLINE / REVISE_OUTLINE / SPLIT / WRITE_SECTION / REVIEW_LANG / REVIEW_LOGIC / REVIEW_FACT（含共享 `_REVIEW_JSON_SCHEMA`，已嵌入 `model_json_schema()` 导出的真实 JSON Schema） |
+| `agents/tools.py` | `web_search()`（成功返回 JSON 数组 [{title,link,body}]，失败/无结果返回 {"error"} 但保留关键词；失败按原因分类、退避重试同一 query）+ `WEB_SEARCH_TOOL`（OpenAI 兼容 function schema） |
 | `search_cache.py` | **两级搜索缓存**：`search_cache` 表（query→web_search 原始结果）+ `topic_materials` 表（topic→审查后素材），SQLite 跨进程复用；`cached_search`（query 级，单飞防并发重复搜索）/ `get_cached_materials`+`store_materials`（topic 级）/ `clear()`（供 `--clear-search-cache`）；TTL 惰性失效 |
 | `agents/outliner.py` | **大纲子智能体**：自包含子图（搜索→审查→生成→自检→补搜/重试/兜底）；搜索多查询 ThreadPool 并行 |
-| `agents/writing.py` | **写作子 Agent**（自包含子图，挂 `writing` 节点）：内部 `split_sections`（拆章，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `merge_sections`（按 id 升序拼装）；`output_schema` 只写回 `draft`/`sections`/`section_drafts`；**不含写作 LLM** |
+| `agents/writing.py` | **写作子 Agent**（自包含子图，挂 `writing` 节点）：内部 `split_sections`（拆章，经 `SplitOutput` 强校验、失败反馈重试，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `merge_sections`（按 id 升序拼装）；`output_schema` 只写回 `draft`/`sections`/`section_drafts`；**不含写作 LLM** |
 | `agents/section_writer.py` | **章节写作子智能体**（自包含子图，挂 `write_section` 节点）：`write`（初稿/重写）→ `self_check`（启发式自检：篇幅/标题/要点）→ `should_rewrite`（条件重写，`MAX_SECTION_ATTEMPTS` 上限）→ `emit`（输出 `section_drafts`）；`output_schema` 限定子图只输出该键 |
-| `agents/review.py` | **审核子智能体**（自包含子图，挂 `edit` 节点）：`START →(fan_out_reviewers: Send×3)→ review_role(并行×3) → aggregate`；3 个审校角色（语言/逻辑/事实）各自独立 `call_llm(json_mode=True, role=edit_xxx)` 输出 JSON（score/passed/**failed_sections**[{id,feedback}]）；多数表决（≥2/3）+ 解析失败重试 `REVIEW_MAX_RETRIES` 次、耗尽**弃权**、全弃权保守通过；`output_schema` 只写回 {final_article, quality_score, passed, failed_sections, revision_count}；**取消润色**（final_article=当前 draft） |
+| `agents/review.py` | **审核子智能体**（自包含子图，挂 `edit` 节点）：`START →(fan_out_reviewers: Send×3)→ review_role(并行×3) → aggregate`；3 个审校角色（语言/逻辑/事实）各自独立 `call_llm(json_mode=True, role=edit_xxx)` 输出 JSON（score/passed/**failed_sections**[{id,feedback}]），经 `ReviewOutput`（pydantic，本模块别名 `ReviewJudgeOutput` 防与子图输出 TypedDict 重名）强校验；多数表决（≥2/3）+ 校验失败重试 `REVIEW_MAX_RETRIES` 次、耗尽**弃权**、全弃权保守通过；`output_schema` 只写回 {final_article, quality_score, passed, failed_sections, revision_count}；**取消润色**（final_article=当前 draft） |
 | `agents/human_review.py` | **人工介入节点**：`interrupt()` 暂停把大纲交给客户端，按 `Command(resume=...)` 的 action（confirm/revise/replace）决定下一步；revise 时把 `outline_review_feedback` 写进 state、经 `route_review` 条件边回环，节点开头按意见重写（REVISE_OUTLINE_PROMPT）再二次确认；`build_graph(enable_human_review=True)` 经条件边启用 |
 | `langsmith_config.py` | LangSmith 配置：读 `.env`、校验环境变量、设置项目名 |
 | `web_server.py` | **Web 页面版后端**（可选）：FastAPI + 单任务运行器（后台 worker 线程跑图，`__interrupt__` 用 `threading.Condition` 挂起、resume API 唤醒续跑）+ 1 个页面路由 `GET /` 与 5 个 API 路由（`/api/models` `/api/run` `/api/status` `/api/resume` `/api/cancel`）；`web/index.html` 是单页前端（表单 / 大纲确认 / 结果展示，`setInterval` 轮询 status） |
@@ -118,7 +119,14 @@ outline 子图（agents/outliner.py，自包含）：
 
 4. **审查失败降级**：`search` 节点里，LLM 审查结果不可用（`_materials_ok` 为假）时**退回原始搜索结果**作为素材——这样即使审查坏了，后续 `should_search_again` 还能基于真实内容判断是否补搜。
 
-5. **JSON 模式要求 prompt 里出现 "json" 字样**：DeepSeek 的 `response_format={"type":"json_object"}` 要求 prompt 中包含 "json" 才生效（各 `REVIEW_*_PROMPT` 里用小写 "json" 满足）。解析失败时 `review_role` **重试**（`REVIEW_MAX_RETRIES=2`，重试提示含"不是合法 json"），重试耗尽该角色**弃权**（`passed=None`，不投通过票、不计入分数均值）——弃权帮不了任何一方凑到多数，**单个健康角色无法单独通过，坏角色不拉偏多数表决**；3 角色全弃权才**保守按通过处理**（`passed=True, score=0`），避免把流程卡进死循环。`revision_count` 只在 `aggregate` 执行时 +1，不因角色重试/并行多计。
+5. **JSON 输出强约束 + 校验失败反馈重试（output_validation.py）**：DeepSeek 官方 API **不支持** `response_format={"type":"json_schema"}`（会报 unavailable），只能客户端强约束。做法：定义 pydantic 输出 model（`ReviewOutput`/`SplitOutput`），`model_json_schema()` 导出真实 JSON Schema 文本嵌入 prompt（`_REVIEW_JSON_SCHEMA`/`SPLIT_PROMPT`），客户端用 `call_json_model()` 以同一 model 强校验——校验失败把**结构化字段错误**（字段路径 + 原因，如 "score: 应为整数"）反馈给模型重试（`REVIEW_MAX_RETRIES=2`），**替代旧版泛泛的"不是合法 json"与静默丢弃**。要点：
+   - **`call_llm` 默认 `json_mode=True`**：审校/拆章经 `call_json_model` 无需显式传参（内部不再传 `json_mode=True`）；仅输出 Markdown 的调用（写正文 `WRITE_SECTION`/`SELF_REVIEW`、修订大纲 `REVISE_OUTLINE`）显式传 `json_mode=False`。`chat()`（outliner 工具调用 + Markdown 输出）不走 json。
+   - **小写 "json" 字样**：DeepSeek 的 `response_format={"type":"json_object"}` 要求 prompt 里出现 "json" 才生效（各 prompt 头文字用小写 json 满足，schema dump 本身不含该词）。
+   - **pydantic 细节**：`model_validate_json` 对非法 JSON 抛 `ValidationError`（type=json_invalid，**无需另捕 json.JSONDecodeError**）；`score:"abc"` 报 `int_parsing`（pydantic 会把 `"85"` 宽松解析成 85）；非 dict 数组报 `model_type`；缺字段报 `missing`。
+   - **调用点必须传自己的模块级 `call_llm`**（`llm_call=call_llm`）：默认参数在模块定义时绑定，显式传才让测试里 `R.call_llm = fake` / `W.call_llm = fake` 的模块级替换继续生效。
+   - **耗尽兜底保留**：审校角色**弃权**（`passed=None`，不投通过票、不计入分数均值）——弃权帮不了任何一方凑到多数，**单个健康角色无法单独通过，坏角色不拉偏多数表决**；3 角色全弃权才**保守按通过处理**（`passed=True, score=0`），避免把流程卡进死循环。拆章回退单章节。加了具体错误反馈后兜底极少触发。
+   - **重名坑**：`agents/review.py` 本身有 `class ReviewOutput(TypedDict)`（子图输出 schema），模块加载时会**覆盖** import 进来的同名 pydantic model（`model_validate_json` 不存在报 AttributeError），故该模块用别名 `ReviewJudgeOutput` 区分。
+   - `revision_count` 只在 `aggregate` 执行时 +1，不因角色重试/并行多计。
 
 6. **ReAct 工具调用**：`chat()` 返回完整响应，`agents/outliner.py` 里手动执行 `tool_calls`（逐条 `web_search`），再把 assistant 消息（含 tool_calls）+ tool 结果放回对话交给审查阶段。
 
@@ -151,7 +159,7 @@ outline 子图（agents/outliner.py，自包含）：
 14. **多模型路由（model_router.py）——角色路由 + fallback 链 + `--model` 覆盖**：10 个 LLM 调用点各带 `role=`（审校是 3 个角色 edit_lang/edit_logic/edit_fact 各 1 次），路由表 `ROLE_MODEL_MAP` 把 role 映射到候选模型链，单次调用失败自动切下一个。要点：
     - **`__default__` 哨兵是 `--model` 生效的关键**：role 链默认都指向哨兵（=跟随全局默认模型），于是 `--model X` 一处切换让所有角色切到 X；将来某环节想用更强模型只改那一个 role 的链（如 `{"edit_fact": ["deepseek-reasoner", DEFAULT_MODEL]}`，让"事实核查"角色用更强模型）。guard：哨兵字符串不能作为真实模型名。
     - **resolve 优先级**：显式 `model=` > role 链 > 全局默认；`json_mode`/`tools` 会带 `required_capabilities`，role 链里能力不符的模型**静默跳过**、显式 model 能力不符**直接报错**。
-    - **fallback 是"API/传输异常"层**（默认 `openai.OpenAIError`，含超时/限流/连接错误），与审核子智能体的 JSON 解析重试（"返回内容非法"层）**两层正交**——前者切模型、后者同模型重试，互不影响。
+    - **fallback 是"API/传输异常"层**（默认 `openai.OpenAIError`，含超时/限流/连接错误），与客户端 pydantic 校验重试（output_validation.py，"返回内容非法"层）**两层正交**——前者按失败原因调整后重试/切模型、后者同模型重试，互不影响。**按失败原因调整**（`_classify_llm_error` + `_retry_delay`）：`rate_limit`（限流，优先服务端 `retry-after` 头、本地退避翻倍）与 `transient`（超时/连接/5xx，指数退避）**不切模型、同模型退避重试** `PER_SPEC_MAX_RETRIES=2` 次——切模型对限流无效（限流是账号/端点级，等待往往就好）；`context_exceeded`（`BadRequestError`，`body.error.code` 含 context_length_exceeded 或 message 含 maximum context length）**按失败信息编辑参数**：把 `adjust["max_tokens"]` 减半后立即重试同一模型（不退避），缩到 `MIN_MAX_TOKENS=512` 仍超才切下一个——`adjust` 是 `llm.py` 传入的可变 dict，闭包读它取当前 max_tokens；`fatal`（认证/权限/其他 400/未知）**重试无意义、直接切下一个模型**。退避 `RETRY_BASE_DELAY=1s` 2 倍递增封顶 `RETRY_MAX_DELAY=4s`。注意 openai 3.x：`APITimeoutError` 是 `APIConnectionError` 的子类（检查父类即可覆盖超时）、`retry-after` 在 `exc.response.headers`（不在 exc 顶层）、`BadRequestError` 的错误码在 `exc.body["error"]["code"]`（不在 exc 顶层，`exc.message` 只是 HTTP 状态文本）。
     - **client 懒加载 + 缓存**：按 `(base_url, api_key_env)` 缓存 OpenAI client；模块导入不读 env，缺 key 在首次真实调用才报友好错误（原 llm.py import 时直接 KeyError）。
     - **教学取舍**：`retryable_exceptions` 默认只捕 OpenAIError、不吞代码 bug；`timeout=300s`（原 openai 默认 600s，超长调用有被切断风险，值可在 ModelSpec 按模型调）。
     - 新参数 `model`/`role` 是 keyword-only，测试 fake 的 `**kw` 可吸收；无参调用行为与旧版完全一致（走全局默认）。
@@ -178,15 +186,26 @@ outline 子图（agents/outliner.py，自包含）：
     - **`revise` 会二次 interrupt**（`route_review` 自环），worker 的 while 循环 + outline 覆盖是硬要求；前端按「大纲内容变了就重新启用操作按钮」刷新确认框。
     - **cancel 仅对 waiting 有效**：running 阶段 `graph.invoke` 原子执行、无法中途打断（打断会静默无效），所以 `/api/cancel` 只在 `waiting` 时接受（running → 409）、前端只在 waiting 显示取消按钮；waiting 取消后 worker 醒来置 `error="canceled"`。run 端点锁外 `build_graph` 失败（如缺 API key）会 try/except 清槽回 idle 再抛 500，绝不残留卡死的 running 槽位。
 
+18. **搜索工具失败重试（tools.py）——失败原因分类驱动重试同一 query**：原 `web_search` 单次调用，失败直接返回失败文本，DDG 限流/网络抖动会把整轮搜索降级成"自身知识兜底"；且失败文本会被 `cached_search` 写进 query 级缓存污染 7 天。**解法**：重试放在 `web_search` 内部（`SEARCH_MAX_RETRIES=2`），每次失败先 `_failure_kind(exc)` 分类失败原因再决定退避/是否重试：
+  - **transient**（超时/连接/未知异常）：指数退避重试同一 query（`RETRY_BASE_DELAY=1s` 2 倍递增，封顶 `RETRY_MAX_DELAY=4s`）；
+  - **ratelimit**（`RatelimitException` 或 message 含 429/rate limit）：退避翻倍——注意 ddgs 的 `_search_sync` 常把限流吞进 `err` 再包成 `DDGSException` 抛，所以类型与 message 文本**都要**判断；
+  - **no_results**（`DDGSException("No results found.")`）：**不是故障、不重试**，直接返回"没有返回结果"——重试无意义，换关键词才有效（交 outliner 补搜链路）。
+  - **确定性 jitter**：`delay += (hash(query) % 10) / 10`，让不同 query 的并发重试错开（同 query 并发由 cached_search 单飞保证只搜一次，不依赖此 jitter）。
+  - **返回 JSON 格式**：成功返回 JSON 数组 `[{title, link, body}]`（title 经 `_clean_title` 清洗、body 截断 500 字）；失败/无结果返回 `{"error": "…"}`，保留"搜索暂时不可用"/"没有返回结果"关键词——返回契约变了但 FAILURE_MARKERS 识别不受影响。`MATERIAL_REVIEW_PROMPT` 已注明输入是 JSON 数组。
+  - 重试耗尽返回失败文本（带最后一次失败原因），让模型回退自身知识；返回契约不变，下游 `_materials_ok` 的 FAILURE_MARKERS 仍能识别。
+  - **遗留问题**：重试耗尽返回的失败文本仍会被 `cached_search` 写入 query 级缓存（污染 7 天）——后续若处理，加"失败结果不写缓存"检测即可。
+  - 测试：`tests/test_tools.py`（27 项，mock `agents.tools.DDGS` 的 context manager，`patch("agents.tools.time")` 隔离 sleep——注意不能 `patch("agents.tools.time.sleep")`，那会改到全局 `time` 模块）。
+
 ## 测试方法
 
 - **确定性控制流测试**：在模块层替换 `O.chat` / `O.cached_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。注意 v2.3 起还需 mock `O.get_cached_materials`/`O.store_materials`（防连真库，见决策 #15）。
 - 参考：`tests/test_outliner_subagent.py`（27 项检查）。核心断言模式：场景 A（素材够，1 轮收敛，chat=3）、B（补搜，chat=5，**断言补搜轮 user 消息带首轮查询记录、首轮不带**）、C（两轮失败兜底，chat=5）、D（提纲两次太短兜底）、E（重试收敛，chat=4）、F（私有键不泄漏，含 `search_history`）、G（主图节点链 {outline, writing, edit} + outline/writing 节点是 `CompiledStateGraph`）、H（并行搜索 3 查询）。
-- 按章节并行写作：`tests/test_section_writer.py`（17 项检查）——mock 主图全部 LLM（`agents.writing.call_llm`/`agents.section_writer.call_llm`/`agents.review.call_llm`/`agents.outliner.chat`），走完整链路验证：split 调 1 次 → write_section 子图 ×N（计数加锁，per-title 版本号断言、不依赖并行执行顺序）→ merge 按 id 顺序正确 → 审核子智能体多数不过 → 打回只重写问题章节（旧草稿被覆盖、其余保留、专属意见传递）→ 二轮三角色全过 → 子图私有键不泄漏。审校按"轮"计数（每轮 = 3 角色各 1 次，共 2 轮 6 次）。这条测试同时守护「共享通道跨子图边界写回」——若 sections/section_drafts 没写回父图，重写轮会丢 v1。
+- 按章节并行写作：`tests/test_section_writer.py`（22 项检查）——mock 主图全部 LLM（`agents.writing.call_llm`/`agents.section_writer.call_llm`/`agents.review.call_llm`/`agents.outliner.chat`），走完整链路验证：split 调 1 次 → write_section 子图 ×N（计数加锁，per-title 版本号断言、不依赖并行执行顺序）→ merge 按 id 顺序正确 → 审核子智能体多数不过 → 打回只重写问题章节（旧草稿被覆盖、其余保留、专属意见传递）→ 二轮三角色全过 → 子图私有键不泄漏。审校按"轮"计数（每轮 = 3 角色各 1 次，共 2 轮 6 次）。这条测试同时守护「共享通道跨子图边界写回」——若 sections/section_drafts 没写回父图，重写轮会丢 v1。并覆盖 split 输出校验失败：输出不合法 → 带具体字段错误反馈重试 → 耗尽量回退单章节（场景 A/B 直接调 `W.split_sections`）。
 - 章节写作子智能体：`tests/test_section_subagent.py`（16 项检查）——mock `agents.section_writer.call_llm`，覆盖首写合格（不触发自检重写，对比旧版无条件反思省 1 次）/ 不合格→重写收敛 / 两次不合格接受 / 审校意见传递 / 要点不做子串检查（避免误判）/ 输出 schema 只暴露 section_drafts。
-- 审核子智能体：`tests/test_review_agent.py`（替代 test_editor_retry.py）——mock `agents.review.call_llm`（fake 用 `kw["role"]` 区分角色，Send 并行顺序不保证、断言用集合），子图直调 `build_review_agent().invoke(...)`，覆盖 3 角色各调一次 / 多数通过（2 票）/ 多数不过（failed_sections 按 id 合并、【角色名】前缀、id 升序）/ 分数均值（含四舍五入）/ 单角色解析失败重试（第二次 user_content 含"不是合法 json"）/ 弃权不拉偏（2 过+1 弃权通过、1 过+1 不过+1 弃权不过、全弃权保守通过）/ revision_count 只 +1 / output_schema 不泄漏私有键。
+- 审核子智能体：`tests/test_review_agent.py`（替代 test_editor_retry.py）——mock `agents.review.call_llm`（fake 用 `kw["role"]` 区分角色，Send 并行顺序不保证、断言用集合），子图直调 `build_review_agent().invoke(...)`，覆盖 3 角色各调一次 / 多数通过（2 票）/ 多数不过（failed_sections 按 id 合并、【角色名】前缀、id 升序）/ 分数均值（含四舍五入）/ 单角色校验失败重试（第二次 user_content 含具体字段校验反馈）/ 弃权不拉偏（2 过+1 弃权通过、1 过+1 不过+1 弃权不过、全弃权保守通过）/ revision_count 只 +1 / output_schema 不泄漏私有键。
+- JSON 输出强校验：`tests/test_output_validation.py`（25 项检查）——直接传 `llm_call=fake` 单测 `call_json_model`：合法返回 model / 非法 JSON→第二次成功且反馈含"没有通过 json 结构校验" / 缺字段反馈含字段名与"缺少该字段" / 类型错（`score:"abc"`）反馈含"应为整数" / 范围错（`score:500`）反馈含"高于允许上限" / 非 dict 数组反馈含"应为 json 对象" / `llm_call` 返回 None 走 json_invalid / 全失败返回 None 且调用次数==max_retries / `retry_prefix` 透传。
 - 人工介入：`tests/test_human_review.py`（22 项检查）——mock `agents.human_review.input`（编程序列）与 `call_llm`，单测节点四种输入（回车/意见重写/粘贴大纲/q 退出）+ 整图开关开走通 + 开关关不触发节点 + 跨进程断点续跑。
-- 多模型路由：`tests/test_model_router.py`（25 项检查）——mock `llm.get_client`（fake client）与 `llm.call_with_fallback`（spy），覆盖 role 路由解析 / `__default__` 哨兵→全局默认 / `set_default_model` 覆盖 / 能力过滤（role 链跳过 vs 显式 model 报错）/ fallback 成功与耗尽（保留 `__cause__`）/ 审校 3 个角色 role 正确传递（跑 `build_review_agent().invoke` 断言最近 3 次调用是 edit_lang/edit_logic/edit_fact）/ 旧无参行为不变 / client 懒加载缓存与缺 env 报错。
+- 多模型路由：`tests/test_model_router.py`（60 项检查）——mock `llm.get_client`（fake client）与 `llm.call_with_fallback`（spy），覆盖 role 路由解析 / `__default__` 哨兵→全局默认 / `set_default_model` 覆盖 / 能力过滤（role 链跳过 vs 显式 model 报错）/ fallback 成功与耗尽（保留 `__cause__`）/ 审校 3 个角色 role 正确传递（跑 `build_review_agent().invoke` 断言最近 3 次调用是 edit_lang/edit_logic/edit_fact）/ 旧无参行为不变 / client 懒加载缓存与缺 env 报错 / **失败分类退避重试**（限流同模型重试成功、`retry-after` 头优先、超时重试成功、瞬时耗尽切下一个模型、认证等致命错误不重试、`_classify_llm_error`/`_retry_delay` 单测） / **按失败信息编辑参数**（`context_length_exceeded` 缩小 `adjust["max_tokens"]` 立即重试同一模型、缩到 `MIN_MAX_TOKENS` 仍超才切下一个、其他 400 走 fatal 切模型；用 `httpx.Request/Response` 构造真实 openai 异常、`patch("model_router.time")` 隔离 sleep）。
 - 搜索缓存：`tests/test_search_cache.py`（18 项检查）——mock `search_cache.web_search`（临时库隔离，覆盖 `DB_PATH`），覆盖 query 级 miss/命中 / key 规范化（首尾空白、大小写）/ TTL 过期重新搜索 / topic 级 store→hit→过期 miss / `clear()` 清空并返回条数 / **并发单飞（8 线程同 query，真实搜索次数 == 1）** / 空 key 不缓存。
 - Web 页面版：`tests/test_web_server.py`（33 项检查）——mock 全部 LLM（`O.chat`/`O.cached_search`/`W.call_llm`/`SW.call_llm`/`R.call_llm`/`HR.call_llm`，mock 套件与 test_section_writer 同一套），TestClient（httpx）驱动后台 worker 线程，覆盖 run→waiting→resume(confirm/revise/replace)→done 状态机（revise 用**谓词等待**防"拿到旧 waiting"竞态、replace 用 `run_until` 的**状态序列**守护"不二次 waiting"）、409/400 校验、cancel（waiting→202、**running→409**）、异常兜底、**run 端点 build_graph 失败→500 清槽回 idle**。**每个用例开头必须 `web_server._reset_for_tests()`**（单槽注册表是进程级全局，cancel→join 线程→清槽→恢复默认模型，否则拿到上个任务状态）。
 - **真实 e2e**：跑 `python main.py "题目" --output out.md`，检查日志出现补搜/重试提示、成品是合法 Markdown、质量分正常。注意真实搜索 + LLM 调用可能超过 5 分钟，超时后转后台即可。

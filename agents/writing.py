@@ -19,7 +19,6 @@ section_drafts/failed_sections/revision_count),内部 拆章 → Send 并行触�
 发生在下一层(section_writer 实例),父图不会出现并发写.
 """
 
-import json
 import logging
 from typing import Annotated, TypedDict
 
@@ -28,6 +27,7 @@ from langgraph.types import Send
 
 from agents.section_writer import build_section_writer
 from llm import call_llm
+from output_validation import SplitOutput, call_json_model
 from prompts import SPLIT_PROMPT
 from state import Section, _merge_dicts
 
@@ -65,21 +65,21 @@ def split_sections(state: WritingState) -> dict:
     """把 outline 文本拆成结构化章节列表,写入 state["sections"].
 
     打回重写时(revision_count > 0 且已有 sections)直接复用,不重复调 LLM.
+    输出经 SplitOutput 强校验,校验失败把具体字段错误反馈给模型重试;耗尽回退单章节.
     """
     if state.get("revision_count", 0) > 0 and state.get("sections"):
         logger.info("→ 复用已拆分的章节…")
         return {}
     logger.info("→ 拆分章节…")
-    raw = call_llm(
+    out = call_json_model(
         SPLIT_PROMPT,
         f"文章题目：{state['topic']}\n\n【提纲】\n{state['outline']}",
-        json_mode=True,
+        SplitOutput,
         role="split",
+        retry_prefix="请重新拆分并重新输出",
+        llm_call=call_llm,
     )
-    try:
-        sections = json.loads(raw).get("sections", [])
-    except json.JSONDecodeError:
-        sections = []
+    sections = out.model_dump()["sections"] if out is not None else []
     if not sections:
         # 兜底:拆章失败时至少给一个章节,避免并发分支为空
         logger.warning("  ⚠ 章节拆分失败，回退为单章节")

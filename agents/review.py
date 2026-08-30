@@ -7,9 +7,10 @@ START →(fan_out_reviewers: Send×3)→ review_role(并行×3) → aggregate(�
 
 3 个审校角色(语言编辑/逻辑结构/事实准确性)各自独立调一次 LLM 打分,互不干扰:
 - 各自输出 {score, passed, failed_sections},经 Send 并行写入私有 reducer 聚合键 role_reviews;
+- 输出经 ReviewOutput(pydantic)强校验,校验失败把具体字段错误反馈给模型重试;
 - aggregate 按"多数表决"聚合:显式通过票达到多数(3 角色即 >= 2)才算整篇通过;
-- 角色 JSON 解析失败重试耗尽 → 弃权(passed=None 不投通过票,也不污染分数均值),
-  避免坏角色把多数表决带偏;3 角色全弃权才保守通过(沿 CLAUDE.md 决策 #5 的"绝不卡死"语义).
+- 校验重试耗尽 → 弃权(passed=None 不投通过票,也不污染分数均值),避免坏角色把
+  多数表决带偏;3 角色全弃权才保守通过(沿 CLAUDE.md 决策 #5 的"绝不卡死"语义).
 
 与父图共享的键:
 - 输入:draft / revision_count
@@ -18,7 +19,6 @@ START →(fan_out_reviewers: Send×3)→ review_role(并行×3) → aggregate(�
 (沿决策 #12/#13 的 Send 并行硬要求,langgraph 1.2.11 实测).
 """
 
-import json
 import logging
 from typing import Annotated, TypedDict
 
@@ -26,6 +26,9 @@ from langgraph.graph import START, END, StateGraph
 from langgraph.types import Send
 
 from llm import call_llm
+# 注意别名:本模块下方还有 `class ReviewOutput(TypedDict)`(子图对外输出 schema),
+# 会把 import 的同名 pydantic model 覆盖掉,故此处用别名 ReviewJudgeOutput 区分.
+from output_validation import ReviewOutput as ReviewJudgeOutput, call_json_model
 from prompts import REVIEW_FACT_PROMPT, REVIEW_LANG_PROMPT, REVIEW_LOGIC_PROMPT
 from state import _merge_dicts
 
@@ -33,11 +36,6 @@ logger = logging.getLogger(__name__)
 
 # 每个审校角色每次最多调 LLM 次数:1 次正式 + 1 次重试;重试耗尽该角色弃权
 REVIEW_MAX_RETRIES = 2
-# 重试提示:JSON 模式要求 prompt 里出现 "json" 字样(各 REVIEW_*_PROMPT 已用小写 json 满足)
-REVIEW_RETRY_NOTE = (
-    "\n\n【警告】上一次输出不是合法 json（已丢弃）。"
-    "请严格只输出一个符合要求的 json 对象，不要夹杂任何其他文字。"
-)
 # 审校角色表:role 名(model_router 注册的 role / prompts 里的角色) -> (prompt, 中文标签)
 REVIEW_ROLES = {
     "edit_lang": (REVIEW_LANG_PROMPT, "语言编辑"),
@@ -83,77 +81,30 @@ class ReviewOutput(TypedDict):
     revision_count: int
 
 
-def _parse_failed_sections(failed) -> list[dict]:
-    """把审校 JSON 里的 failed_sections 解析成 [{id, feedback}] 列表.
-
-    支持两种输入:
-    - 新格式:[{"id": 0, "feedback": "该章节的具体修改意见"}, ...]
-    - 兼容旧格式:纯编号 [0, 2](feedback 留空)
-    无法解析的条目直接丢弃,保证返回的都是合法结构.
-    """
-    result = []
-    if not isinstance(failed, list):
-        return result
-    for item in failed:
-        if isinstance(item, dict) and item.get("id") is not None:
-            try:
-                sid = int(item["id"])
-            except (TypeError, ValueError):
-                continue
-            feedback = str(item.get("feedback", "")).strip()
-            result.append({"id": sid, "feedback": feedback})
-        elif isinstance(item, (int, float)) or (isinstance(item, str) and item.isdigit()):
-            result.append({"id": int(item), "feedback": ""})
-    return result
-
-
-def _parse_review_output(raw: str) -> tuple[int, bool, list[dict]]:
-    """解析单个角色的审校 json;返回 (score, passed, failed_sections).
-
-    任一字段不合法都会抛 (json.JSONDecodeError, ValueError),由 review_role 的
-    重试循环调用:解析失败就重试,重试耗尽该角色弃权.
-    """
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        # 模型输出 JSON 数组/裸值/null 时 data.get 会抛 AttributeError/TypeError,
-        # 归一成 ValueError 让重试循环接管(否则会击穿整图,见 CLAUDE.md 决策 #5)
-        raise ValueError("审校输出不是 json 对象，无法解析")
-    raw_score = data.get("score", 60)
-    if raw_score is None:
-        raise ValueError("score 字段为空，无法解析")
-    score = int(raw_score)  # 非整数值会抛 ValueError,触发重试
-    passed = bool(data.get("passed", True))  # 沿用旧宽松默认 True
-    failed_sections = _parse_failed_sections(data.get("failed_sections", []))
-    return score, passed, failed_sections
-
-
 def review_role(state: ReviewState) -> dict:
-    """单个审校角色:按 role_name 选 prompt,json_mode 调用,解析失败重试,耗尽弃权.
+    """单个审校角色:按 role_name 选 prompt,json_mode 调用 + pydantic 强校验.
 
     由 fan_out_reviewers 的 Send 并行触发多次(每个角色一个实例);只写私有 reducer
     聚合键 role_reviews(role_name -> {score, passed, failed_sections}).
-    解析失败重试 REVIEW_MAX_RETRIES 次(重试提示附"上次不是合法 json");耗尽弃权
-    passed=None -- 不投通过票,也不污染分数均值(多数表决不拉偏,见 CLAUDE.md 决策 #5).
+    输出经 ReviewOutput 强校验,校验失败把具体字段错误(字段路径+原因)反馈给模型
+    重试 REVIEW_MAX_RETRIES 次;耗尽该角色弃权 passed=None -- 不投通过票,也不
+    污染分数均值(多数表决不拉偏,见 CLAUDE.md 决策 #5).
     """
     role_name = state["role_name"]
     prompt, label = REVIEW_ROLES[role_name]
     base_content = f"请从【{label}】的角度审校下面这篇中文文章草稿：\n\n{state['draft']}"
-    user_content = base_content
     review = {"score": 0, "passed": None, "failed_sections": []}  # 默认:弃权
-    for attempt in range(1, REVIEW_MAX_RETRIES + 1):
-        raw = call_llm(prompt, user_content, json_mode=True, role=role_name)
-        try:
-            score, passed, failed_sections = _parse_review_output(raw)
-            review = {
-                "score": score,
-                "passed": passed,
-                "failed_sections": failed_sections,
-            }
-            break
-        except (json.JSONDecodeError, ValueError):
-            logger.warning(f"  ⚠ 【{label}】审校输出解析失败（第 {attempt} 次）")
-            if attempt < REVIEW_MAX_RETRIES:
-                user_content = base_content + REVIEW_RETRY_NOTE
+    out = call_json_model(
+        prompt,
+        base_content,
+        ReviewJudgeOutput,
+        role=role_name,
+        max_retries=REVIEW_MAX_RETRIES,
+        retry_prefix="请重新审校并重新输出",
+        llm_call=call_llm,
+    )
+    if out is not None:
+        review = out.model_dump()  # {"score", "passed", "failed_sections": [{id, feedback}]}
     return {"role_reviews": {role_name: review}}
 
 

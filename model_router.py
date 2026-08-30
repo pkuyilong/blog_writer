@@ -3,7 +3,7 @@
 职责分层:
 - **router 管"选哪个模型 + 怎么兜底"**:注册表(MODEL_REGISTRY),角色→模型链
   (ROLE_MODEL_MAP),全局默认模型(--model 可覆盖),OpenAI client 懒加载与缓存,
-  单次调用失败自动切下一个模型重试.
+  单次调用失败按原因退避重试、耗尽再切下一个模型.
 - **llm.py 管"消息形状 + @traceable"**:组装 messages,json_mode/tools,委托本模块.
 
 即使目前只注册一个模型(deepseek-v4-flash),路由/fallback 架构是完整的:
@@ -17,9 +17,17 @@ ROLE_MODEL_MAP 里给某个 role 配置 fallback 链,无需改动任何调用点
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 
-from openai import OpenAI, OpenAIError
+from openai import (
+    APIConnectionError,
+    BadRequestError,
+    InternalServerError,
+    OpenAI,
+    OpenAIError,
+    RateLimitError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,18 +172,95 @@ def resolve_chain(
     return specs
 
 
+# 单模型内失败重试次数: 限流/超时/连接等瞬时错误不切模型, 按失败原因退避后重试
+# 同一模型(切模型对限流无效——限流是账号/端点级的, 退避等待往往就好).
+PER_SPEC_MAX_RETRIES = 2
+# 退避基数(秒); 限流类失败退避翻倍; 单次等待封顶, 避免拖慢整轮.
+RETRY_BASE_DELAY = 1.0
+RETRY_MAX_DELAY = 4.0
+RATE_LIMIT_BACKOFF = 2.0
+# context_length_exceeded 时缩小 max_tokens 的下限(低于此就放弃缩小, 切下一个模型)
+MIN_MAX_TOKENS = 512
+
+
+def _classify_llm_error(exc: Exception) -> str:
+    """分类 LLM 调用失败原因, 返回 rate_limit / transient / context_exceeded / fatal.
+
+    - rate_limit(RateLimitError): 限流是账号/端点级的, 换模型无效, 退避(优先
+      服务端 retry-after 头)后重试同一模型
+    - transient(APIConnectionError 含超时 / InternalServerError): 瞬时故障,
+      退避后重试; 注意 openai 里 APITimeoutError 是 APIConnectionError 的子类,
+      检查父类即可覆盖
+    - context_exceeded(BadRequestError, body.error.code 含 context_length_exceeded
+      或 message 含 maximum context length): 请求超上下文上限, 这是可"编辑参数"
+      的错误——缩小 max_tokens 再重试同一模型(见 call_with_fallback 的 adjust)
+    - fatal(认证/权限/其他参数/未知): 重试无意义或无法自动编辑, 立即切下一个模型
+    """
+    if isinstance(exc, RateLimitError):
+        return "rate_limit"
+    if isinstance(exc, (APIConnectionError, InternalServerError)):
+        return "transient"
+    if isinstance(exc, BadRequestError):
+        body = getattr(exc, "body", None)
+        err = body.get("error") if isinstance(body, dict) else None
+        code = str((err or {}).get("code") or "").casefold()
+        msg = str((err or {}).get("message") or "").casefold() if isinstance(err, dict) else ""
+        if "context_length_exceeded" in code or "maximum context length" in msg:
+            return "context_exceeded"
+        return "fatal"  # 其他 400 参数错误(如字段非法), 无法自动编辑
+    return "fatal"
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """从限流错误的响应头读服务端建议的等待秒数(无则 None), 按失败信息调整退避."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return None
+    val = headers.get("retry-after")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_delay(attempt: int, kind: str, *, exc: Exception | None = None) -> float:
+    """第 attempt 次重试前的等待秒数: 指数退避, 限流翻倍, 封顶.
+
+    限流时优先采用服务端 retry-after 头(它通常更准), 没有才用本地退避.
+    """
+    if kind == "rate_limit" and exc is not None:
+        server = _retry_after_seconds(exc)
+        if server is not None:
+            return min(server, RETRY_MAX_DELAY)
+    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+    if kind == "rate_limit":
+        delay *= RATE_LIMIT_BACKOFF
+    return min(delay, RETRY_MAX_DELAY)
+
+
 def call_with_fallback(
     specs: list[ModelSpec],
     func,
     *,
     role: str | None = None,
     retryable_exceptions: tuple = (OpenAIError,),
+    adjust: dict | None = None,
 ):
-    """按顺序逐个用 specs 里的模型执行 func(spec),失败切下一个.
+    """按顺序逐个用 specs 里的模型执行 func(spec),失败按原因调整后切下一个.
 
-    全部失败抛 ModelRoutingError,并用 `from last_exc` 保留最后一次异常的
+    每个模型内先按失败原因调整再重试(PER_SPEC_MAX_RETRIES 次):
+    - rate_limit / transient: 退避(限流优先 retry-after 头)后重试同一模型;
+    - context_exceeded: **按失败原因编辑参数**——把 adjust["max_tokens"] 减半后
+      立即重试同一模型(不退避), 缩到 MIN_MAX_TOKENS 仍超才切下一个;
+    - fatal(认证/权限/其他参数/未知): 重试无意义, 立即切下一个模型.
+    全部失败抛 ModelRoutingError, 并用 `from last_exc` 保留最后一次异常的
     __cause__,便于排查根因.
 
+    adjust: 可选可变 dict(键 max_tokens), 由 llm.py 传入, 供 context_exceeded
+    时缩小请求的 max_tokens 再重试. 不传则 context_exceeded 按 fatal 处理.
     教学取舍:默认只捕获 openai.OpenAIError(含 APITimeoutError/APIStatusError/
     APIConnectionError/RateLimitError 等),不吞代码自身 bug--把"模型失败"和
     "程序 bug"分开,避免悄悄降级掩盖问题.需要吞更多异常可显式传入
@@ -183,18 +268,37 @@ def call_with_fallback(
     """
     last_exc = None
     for i, spec in enumerate(specs):
-        try:
-            return func(spec)
-        except retryable_exceptions as e:
-            last_exc = e
-            if i < len(specs) - 1:
+        for attempt in range(PER_SPEC_MAX_RETRIES + 1):
+            try:
+                return func(spec)
+            except retryable_exceptions as e:
+                last_exc = e
+                kind = _classify_llm_error(e)
+                if kind == "fatal":
+                    break  # 重试无意义, 直接切下一个模型
+                if attempt >= PER_SPEC_MAX_RETRIES:
+                    break  # 当前模型重试耗尽(含 context 缩小次数), 切下一个
+                if kind == "context_exceeded":
+                    if adjust is not None and adjust["max_tokens"] > MIN_MAX_TOKENS:
+                        adjust["max_tokens"] = max(adjust["max_tokens"] // 2, MIN_MAX_TOKENS)
+                        logger.warning(
+                            f"  ⚠ 模型 {spec.name} 上下文超长，按失败信息把 max_tokens "
+                            f"缩小到 {adjust['max_tokens']} 重试…"
+                        )
+                        continue  # 立即用更小 budget 重试, 不退避
+                    break  # 无 adjust 或已缩到最小仍超 → 切下一个模型
+                delay = _retry_delay(attempt + 1, kind, exc=e)
                 logger.warning(
-                    f"  ⚠ 模型 {spec.name} 调用失败（{type(e).__name__}: {e}），切下一个…"
+                    f"  ⚠ 模型 {spec.name} 调用失败（{type(e).__name__}: {e}），"
+                    f"按 {kind} 退避 {delay:.1f}s 后重试…"
                 )
-            else:
-                logger.error(
-                    f"  ✗ 模型 {spec.name} 调用失败，role={role} 备用模型已耗尽"
-                )
+                time.sleep(delay)
+        if i < len(specs) - 1:
+            logger.warning(
+                f"  ⚠ 模型 {spec.name} 调用失败（{type(last_exc).__name__}: {last_exc}），切下一个…"
+            )
+        else:
+            logger.error(f"  ✗ 模型 {spec.name} 调用失败，role={role} 备用模型已耗尽")
     raise ModelRoutingError(
         f"role={role!r} 的 {len(specs)} 个模型调用全部失败"
     ) from last_exc
