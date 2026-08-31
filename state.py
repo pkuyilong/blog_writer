@@ -6,6 +6,17 @@ def _merge_dicts(a: dict, b: dict) -> dict:
     return {**a, **b}
 
 
+def initial_state(topic: str) -> dict:
+    """构造图初始输入:题目 + 空中间产物. main.py 与 web_server.py 共用同一份."""
+    return {
+        "topic": topic,
+        "sections": [],
+        "section_drafts": {},
+        "failed_sections": [],
+        "revision_count": 0,
+    }
+
+
 class Section(TypedDict):
     """split 拆分出的单个章节结构.id 由 split_sections 程序补(enumerate 编号)."""
     id: int

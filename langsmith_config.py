@@ -20,6 +20,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_configured = False  # 幂等标记: 本模块配置只做一次, 避免 build_graph 每次构建重复读 .env/告警
+
 
 def _load_env_file() -> None:
     """读取项目根目录的 .env 文件并注入环境变量(已存在的环境变量不覆盖).
@@ -48,7 +50,13 @@ def setup_langsmith(project_name: str | None = None) -> None:
 
     Args:
         project_name: 项目名,会写入 LANGCHAIN_PROJECT 环境变量.
+
+    幂等:build_graph 每次构建都会调本函数, .env 读取与日志只做一次.
     """
+    global _configured
+    if _configured:
+        return
+    _configured = True
     # 先尝试从项目根目录的 .env 文件加载配置
     _load_env_file()
 

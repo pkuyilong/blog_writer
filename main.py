@@ -9,6 +9,7 @@ from langgraph.types import Command
 import memory_store
 from graph import build_graph
 from logging_config import setup_logging
+from state import initial_state
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +121,7 @@ def _run(args, checkpointer) -> int:
                 f"题目：《{args.topic}》（thread_id={thread_id}；"
                 f"中途退出可用 --resume {thread_id} 断点续跑）\n"
             )
-            initial_input = {
-                "topic": args.topic,
-                "sections": [],
-                "section_drafts": {},
-                "failed_sections": [],
-                "revision_count": 0,
-            }
+            initial_input = initial_state(args.topic)
 
         result = _interactive_invoke(graph, config, initial_input, thread_id)
 
@@ -218,9 +213,7 @@ def main() -> int:
 
     # --clear-memory:独立维护命令, 清空 .store/ 长期记忆库后退出, 与模型/题目无关
     if args.clear_memory:
-        from memory_store import clear as clear_memory
-
-        n = clear_memory()
+        n = memory_store.clear()
         logger.info(f"🧹 已清空长期记忆库: 删除 {n} 个文件")
         return 0
 

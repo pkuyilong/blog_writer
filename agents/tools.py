@@ -16,6 +16,8 @@ from ddgs import DDGS
 from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
 from pydantic import BaseModel, Field
 
+from retry import RETRY_BASE_DELAY, RETRY_MAX_DELAY, backoff_delay
+
 logger = logging.getLogger(__name__)
 
 MAX_RESULTS = 5
@@ -23,9 +25,6 @@ REGION = "cn-zh"  # 中文区域,能让维基百科等中文权威源更靠前
 
 # 重试策略:初次调用失败后再重试 SEARCH_MAX_RETRIES 次
 SEARCH_MAX_RETRIES = 2
-# 指数退避基数(秒);限流类失败退避翻倍;单次等待封顶,避免拖慢整轮并行搜索
-RETRY_BASE_DELAY = 1.0
-RETRY_MAX_DELAY = 4.0
 
 
 def _failure_kind(exc: Exception) -> str:
@@ -55,11 +54,8 @@ def _failure_kind(exc: Exception) -> str:
 
 
 def _retry_delay(attempt: int, *, ratelimited: bool = False) -> float:
-    """第 attempt 次重试前的等待秒数: 指数退避, 限流翻倍, 封顶 RETRY_MAX_DELAY."""
-    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-    if ratelimited:
-        delay *= 2
-    return min(delay, RETRY_MAX_DELAY)
+    """第 attempt 次重试前的等待秒数: 指数退避, 限流翻倍, 封顶(公式见 retry.backoff_delay)."""
+    return backoff_delay(attempt, ratelimited=ratelimited)
 
 
 def _clean_title(title: str) -> str:

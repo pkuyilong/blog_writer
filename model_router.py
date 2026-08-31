@@ -29,6 +29,8 @@ from openai import (
     RateLimitError,
 )
 
+from retry import RETRY_MAX_DELAY, backoff_delay
+
 logger = logging.getLogger(__name__)
 
 # 哨兵:ROLE_MODEL_MAP 里出现它表示"跟随全局默认模型".
@@ -175,10 +177,6 @@ def resolve_chain(
 # 单模型内失败重试次数: 限流/超时/连接等瞬时错误不切模型, 按失败原因退避后重试
 # 同一模型(切模型对限流无效——限流是账号/端点级的, 退避等待往往就好).
 PER_SPEC_MAX_RETRIES = 2
-# 退避基数(秒); 限流类失败退避翻倍; 单次等待封顶, 避免拖慢整轮.
-RETRY_BASE_DELAY = 1.0
-RETRY_MAX_DELAY = 4.0
-RATE_LIMIT_BACKOFF = 2.0
 # context_length_exceeded 时缩小 max_tokens 的下限(低于此就放弃缩小, 切下一个模型)
 MIN_MAX_TOKENS = 512
 
@@ -227,7 +225,7 @@ def _retry_after_seconds(exc: Exception) -> float | None:
 
 
 def _retry_delay(attempt: int, kind: str, *, exc: Exception | None = None) -> float:
-    """第 attempt 次重试前的等待秒数: 指数退避, 限流翻倍, 封顶.
+    """第 attempt 次重试前的等待秒数: 指数退避, 限流翻倍, 封顶(公式见 retry.backoff_delay).
 
     限流时优先采用服务端 retry-after 头(它通常更准), 没有才用本地退避.
     """
@@ -235,10 +233,7 @@ def _retry_delay(attempt: int, kind: str, *, exc: Exception | None = None) -> fl
         server = _retry_after_seconds(exc)
         if server is not None:
             return min(server, RETRY_MAX_DELAY)
-    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-    if kind == "rate_limit":
-        delay *= RATE_LIMIT_BACKOFF
-    return min(delay, RETRY_MAX_DELAY)
+    return backoff_delay(attempt, ratelimited=(kind == "rate_limit"))
 
 
 def call_with_fallback(

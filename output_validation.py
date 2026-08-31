@@ -80,17 +80,26 @@ class SplitOutput(BaseModel):
 
 # ===== 校验错误格式化 + 重试反馈拼装 =====
 
+def _loc_and_hint(err: dict) -> tuple[str, str]:
+    """从单条 pydantic 校验错误取「字段路径 + 中文原因」, 供两个 formatter 共用.
+
+    路径用 . 连接(嵌套如 failed_sections.0.feedback);空路径(非法 JSON / 非对象)
+    记作"根对象";未收录的 type 原样输出.
+    """
+    loc = ".".join(str(x) for x in err["loc"]) or "根对象"
+    hint = _TYPE_HINTS.get(err["type"], err["type"])
+    return loc, hint
+
+
 def _format_validation_errors(exc: ValidationError, limit: int = 10) -> list[str]:
     """把 exc.errors() 格式化成「字段路径 + 原因」的中文行,供拼进重试 user_content.
 
-    路径用 . 连接(嵌套如 failed_sections.0.feedback);空路径(非法 JSON / 非对象)
-    记作"根对象". 超过 limit 条时提示先修复前几条.
+    超过 limit 条时提示先修复前几条.
     """
     lines = []
     errs = exc.errors()
     for err in errs[:limit]:
-        loc = ".".join(str(x) for x in err["loc"]) or "根对象"
-        hint = _TYPE_HINTS.get(err["type"], err["type"])
+        loc, hint = _loc_and_hint(err)
         lines.append(f"- {loc}: {hint}（原始信息：{err.get('msg', '')}）")
     if len(errs) > limit:
         lines.append(f"- ……（共 {len(errs)} 处问题，请先修复以上 {limit} 处）")
@@ -109,8 +118,7 @@ def format_tool_arg_errors(arguments: str, exc: ValidationError) -> str:
         actual = None
     lines = []
     for err in exc.errors()[:5]:
-        loc = ".".join(str(x) for x in err["loc"]) or "根对象"
-        hint = _TYPE_HINTS.get(err["type"], err["type"])
+        loc, hint = _loc_and_hint(err)
         got = ""
         if isinstance(actual, dict):
             key = err["loc"][0] if err["loc"] else None
@@ -118,6 +126,18 @@ def format_tool_arg_errors(arguments: str, exc: ValidationError) -> str:
                 got = f"（实际收到：{json.dumps(actual[key], ensure_ascii=False)}）"
         lines.append(f"- {loc}: {hint}{got}")
     return "\n".join(lines)
+
+
+def tool_arg_error_content(arguments: str, exc: ValidationError) -> str:
+    """构造「工具参数校验失败」的 tool 消息内容(把具体字段错误反馈给模型重新生成).
+
+    与 format_tool_arg_errors 配套, 供 outliner.search 把非法工具调用转成带具体错误的
+    tool 消息(而非静默丢弃/抛异常), 错误消息的 JSON 结构只此一份.
+    """
+    return json.dumps(
+        {"error": "工具参数校验失败: " + format_tool_arg_errors(arguments, exc)},
+        ensure_ascii=False,
+    )
 
 
 def _build_retry_content(base: str, error_lines: list[str], prefix: str) -> str:

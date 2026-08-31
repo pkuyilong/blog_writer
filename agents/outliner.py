@@ -14,7 +14,6 @@
 回父图 state(已对 langgraph 1.2.11 实测验证).
 """
 
-import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
@@ -24,7 +23,7 @@ from langgraph.store.base import BaseStore
 from pydantic import ValidationError
 
 from llm import chat
-from memory_store import load_prefs, load_topic_history
+from memory_store import load_topic_history, prefs_block
 from prompts import (
     FALLBACK_OUTLINE_PROMPT,
     OUTLINER_PROMPT,
@@ -32,7 +31,7 @@ from prompts import (
     MATERIAL_REVIEW_PROMPT,
 )
 from agents.tools import WEB_SEARCH_TOOL, WebSearchArgs
-from output_validation import format_tool_arg_errors
+from output_validation import tool_arg_error_content
 from search_cache import cached_search, get_cached_materials, store_materials
 
 logger = logging.getLogger(__name__)
@@ -86,20 +85,19 @@ def _materials_ok(materials: str) -> bool:
     return not any(m in t for m in FAILURE_MARKERS)
 
 
-def _run_search(tc) -> tuple[str, str]:
+def _run_search(tc, args=None) -> tuple[str, str]:
     """执行单个搜索查询,返回 (tool_call_id, 搜索结果文本).供线程池并行调用.
 
-    参数强校验:WebSearchArgs.model_validate_json 解析并校验模型生成的工具参数,
-    非法参数返回错误文本而非抛异常(正常路径由 search 节点提前校验兜底, 这里作防御);
-    合法时走 cached_search:query 级缓存命中直接返回, 未命中真实搜索并写库(见 search_cache.py).
+    参数强校验:正常路径由 search 节点先分类校验、把已校验的 WebSearchArgs 传入, 避免
+    重复解析; 防御路径(未传 args, 如测试直调)对原始 arguments 再校验一次, 非法参数
+    返回错误文本而非抛异常. 合法时走 cached_search:query 级缓存命中直接返回, 未命中
+    真实搜索并写库(见 search_cache.py).
     """
-    try:
-        args = WebSearchArgs.model_validate_json(tc.function.arguments)
-    except ValidationError as exc:
-        return tc.id, json.dumps(
-            {"error": "工具参数校验失败: " + format_tool_arg_errors(tc.function.arguments, exc)},
-            ensure_ascii=False,
-        )
+    if args is None:
+        try:
+            args = WebSearchArgs.model_validate_json(tc.function.arguments)
+        except ValidationError as exc:
+            return tc.id, tool_arg_error_content(tc.function.arguments, exc)
     query = args.query
     logger.info(f"    🔍 搜索：{query}")
     return tc.id, cached_search(query)
@@ -142,85 +140,77 @@ def search(state: OutlineState) -> dict:
     # 作为 tool 消息反馈给模型重新生成; 合法调用立即并行执行。MAX_TOOL_ARGS_ATTEMPTS 次
     # 仍非法则跳过。所有 tool_calls 都有配对 tool 消息, 维持"孤儿 tool 消息"不变量
     # (CLAUDE.md 决策 #1:重试是同一 search 节点内的多轮规划, 跨 search 节点仍重建干净对话).
-    valid_tcs: list = []  # 通过校验且已执行的 tool_call(跨重试轮累积)
-    materials: str | None = None
-    for arg_attempt in range(MAX_TOOL_ARGS_ATTEMPTS + 1):
-        response = chat(RESEARCHER_PROMPT, messages, tools=[WEB_SEARCH_TOOL], role="research")
-        msg = response.choices[0].message
-        if not msg.tool_calls:
-            # 模型认为不需要搜索:直接把它给出的内容当作素材
-            materials = msg.content or ""
-            break
-        # 把含工具调用的助手消息放回对话(其后的 tool 结果/错误消息与之配对)
-        messages.append(
-            {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ],
-            }
-        )
-        good, bad = [], []
-        for tc in msg.tool_calls:
-            try:
-                WebSearchArgs.model_validate_json(tc.function.arguments)
-                good.append(tc)
-            except ValidationError as exc:
-                bad.append((tc, exc))
-        # 合法调用立即并行执行(结果作为 tool 消息);非法调用反馈具体校验错误
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_SEARCHES) as ex:
-            for tc_id, content in ex.map(_run_search, good):
+    executed: list = []  # 已校验通过且已执行的 (tool_call, WebSearchArgs), 跨重试轮累积
+    materials: str = ""
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_SEARCHES) as ex:
+        for arg_attempt in range(MAX_TOOL_ARGS_ATTEMPTS + 1):
+            response = chat(RESEARCHER_PROMPT, messages, tools=[WEB_SEARCH_TOOL], role="research")
+            msg = response.choices[0].message
+            if not msg.tool_calls:
+                # 模型认为不需要搜索:直接把它给出的内容当作素材
+                materials = msg.content or ""
+                break
+            # 把含工具调用的助手消息放回对话(其后的 tool 结果/错误消息与之配对)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in msg.tool_calls
+                    ],
+                }
+            )
+            # 参数强校验分类:合法调用记 (tc, args), 非法记 (tc, exc)
+            good, bad = [], []
+            for tc in msg.tool_calls:
+                try:
+                    good.append((tc, WebSearchArgs.model_validate_json(tc.function.arguments)))
+                except ValidationError as exc:
+                    bad.append((tc, exc))
+            # 合法调用立即并行执行(结果作为 tool 消息);非法调用反馈具体校验错误
+            for tc_id, content in ex.map(lambda p: _run_search(*p), good):
                 messages.append(
                     {"role": "tool", "tool_call_id": tc_id, "content": content}
                 )
-        for tc, exc in bad:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(
-                        {
-                            "error": "工具参数校验失败: "
-                            + format_tool_arg_errors(tc.function.arguments, exc)
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-            )
-        valid_tcs.extend(good)
-        if not bad:
-            break
-        if arg_attempt < MAX_TOOL_ARGS_ATTEMPTS:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "以上工具调用的参数未通过 json 结构校验，请按上述字段路径逐一修正后"
-                        "重新生成工具调用，已成功的查询不要重复。"
-                    ),
-                }
-            )
-        else:
-            logger.warning(
-                f"  ⚠ 工具参数校验 {MAX_TOOL_ARGS_ATTEMPTS + 1} 次仍失败，"
-                f"跳过 {len(bad)} 条非法调用，本轮已执行 {len(good)} 条合法调用"
-            )
-            break
+            for tc, exc in bad:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_arg_error_content(tc.function.arguments, exc),
+                    }
+                )
+            executed.extend(good)
+            if not bad:
+                break
+            if arg_attempt < MAX_TOOL_ARGS_ATTEMPTS:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "以上工具调用的参数未通过 json 结构校验，请按上述字段路径逐一修正后"
+                            "重新生成工具调用，已成功的查询不要重复。"
+                        ),
+                    }
+                )
+            else:
+                logger.warning(
+                    f"  ⚠ 工具参数校验 {MAX_TOOL_ARGS_ATTEMPTS + 1} 次仍失败，"
+                    f"跳过 {len(bad)} 条非法调用，本轮已执行 {len(good)} 条合法调用"
+                )
+                break
 
-    if valid_tcs:
+    if executed:
         # 记录本轮实际执行的查询(去重保序),写回私有键供下一轮补搜参考
-        new_queries = [
-            WebSearchArgs.model_validate_json(tc.function.arguments).query for tc in valid_tcs
-        ]
+        new_queries = [args.query for _, args in executed]
         history = list(dict.fromkeys(history + new_queries))
         # 阶段二:让模型审查搜索结果,筛选出可靠素材
         logger.info("  🧐 审查搜索结果素材…")
@@ -244,9 +234,6 @@ def search(state: OutlineState) -> dict:
             materials = "\n\n".join(
                 m.get("content", "") for m in messages if m.get("role") == "tool"
             )
-    elif materials is None:
-        # 模型未搜索或全部参数非法且无内容:素材空 → 触发补搜/兜底
-        materials = ""
 
     # 素材可用才写入 topic 缓存(不足素材不缓存, 避免下次命中坏缓存再触发补搜)
     if _materials_ok(materials):
@@ -276,9 +263,7 @@ def generate(state: OutlineState, config, *, store: BaseStore | None) -> dict:
     )
     if attempt > 1:
         user_content += "\n\n（上一版提纲不够完整/可用，请基于素材输出一份更完整、可直接支撑写作的提纲。）"
-    prefs = load_prefs(store)
-    if prefs:
-        user_content += f"\n\n【写作偏好（来自长期记忆）】{prefs}"
+    user_content += prefs_block(store)
     history = load_topic_history(store, state["topic"])
     if history:
         user_content += f"\n\n【历史写作记录】{history}"

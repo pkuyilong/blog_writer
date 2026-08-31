@@ -27,7 +27,7 @@ from langgraph.graph import START, END, StateGraph
 from langgraph.store.base import BaseStore
 
 from llm import call_llm
-from memory_store import load_prefs
+from memory_store import prefs_block
 from prompts import SELF_REVIEW_PROMPT, WRITE_SECTION_PROMPT
 from state import _merge_dicts
 
@@ -121,9 +121,7 @@ def write(state: SectionWriterState, config, *, store: BaseStore | None) -> dict
         prompt = SELF_REVIEW_PROMPT
 
     # 长期记忆:用户偏好注入(来自 memory_store, 跨任务持久化), 覆盖首写与重写两个分支
-    prefs = load_prefs(store)
-    if prefs:
-        user_content += f"\n\n【写作偏好（来自长期记忆）】{prefs}"
+    user_content += prefs_block(store)
 
     if state.get("feedback"):
         user_content += f"\n\n【上轮审校意见】{state['feedback']}\n请逐条针对意见修改本章节。"

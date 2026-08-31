@@ -56,6 +56,33 @@ def open_store(path: str = DB_PATH):
         conn.close()
 
 
+# 进程级 store 单例:get_store 懒加载同一实例, close_store 关闭连接供测试重置.
+# web_server 常驻进程用单例复用同一 sqlite 连接; main.py 仍走 with open_store()(一次性,
+# 不共享单例). 上下文生命周期必须留在模块级: 若 open_store(path).__enter__() 拿到的
+# context manager 被 GC, 生成器的 finally: conn.close() 立即执行, store 连接被关
+# (实测踩坑, 见 CLAUDE.md 决策 #20).
+_singleton = None
+_singleton_cm = None
+
+
+def get_store(path: str = DB_PATH) -> BaseStore:
+    """进程级懒加载单例 SqliteStore(供 web_server 等常驻进程复用同一连接)."""
+    global _singleton, _singleton_cm
+    if _singleton is None:
+        _singleton_cm = open_store(path)
+        _singleton = _singleton_cm.__enter__()
+    return _singleton
+
+
+def close_store() -> None:
+    """关闭并重置单例(测试 teardown 用); 下次 get_store() 按当前 path 懒重建."""
+    global _singleton, _singleton_cm
+    if _singleton_cm is not None:
+        _singleton_cm.__exit__(None, None, None)  # 触发 open_store 的 finally: conn.close()
+        _singleton_cm = None
+    _singleton = None
+
+
 def parse_prefs_arg(raw: str) -> dict:
     """解析 --prefs 参数为 dict: "风格:轻松口语,篇幅:3000字" -> {"风格": "轻松口语", ...}.
 
@@ -87,6 +114,11 @@ def save_prefs(store: BaseStore | None, prefs: dict) -> None:
         logger.info(f"🧠 已写入用户偏好: {prefs}")
 
 
+def _fmt_prefs(prefs: dict) -> str:
+    """偏好 dict → 注入/显示文本(中文冒号, 分号分隔). load_prefs 与 dump_memory 共用."""
+    return "；".join(f"{k}：{v}" for k, v in prefs.items())
+
+
 def load_prefs(store: BaseStore | None) -> str | None:
     """读用户偏好, 格式化为注入文本; 无记录/store 为 None 返回 None(不注入)."""
     if store is None:
@@ -94,7 +126,28 @@ def load_prefs(store: BaseStore | None) -> str | None:
     item = store.get(PREFS_NS, _PREFS_KEY)
     if item is None:
         return None
-    return "；".join(f"{k}：{v}" for k, v in item.value.items())
+    return _fmt_prefs(item.value)
+
+
+def prefs_block(store: BaseStore | None) -> str:
+    """返回【写作偏好】注入块(含标签), 无偏好/store 为 None 时返回空串.
+
+    供 outliner.generate / section_writer.write 等各 agent 拼进 user_content,
+    标签文案与拼接逻辑只此一份.
+    """
+    prefs = load_prefs(store)
+    if not prefs:
+        return ""
+    return f"\n\n【写作偏好（来自长期记忆）】{prefs}"
+
+
+def _fmt_topic_record(v: dict) -> str:
+    """单条题目记录的质量信号片段, load_topic_history 与 dump_memory 共用."""
+    return (
+        f"质量分 {v.get('quality_score', '?')}/100，"
+        f"审校 {v.get('revision_count', '?')} 次，"
+        f"通过 {'是' if v.get('passed') else '否'}"
+    )
 
 
 def load_topic_history(store: BaseStore | None, topic: str) -> str | None:
@@ -104,13 +157,32 @@ def load_topic_history(store: BaseStore | None, topic: str) -> str | None:
     item = store.get(TOPICS_NS, topic)
     if item is None:
         return None
-    v = item.value
-    return (
-        f"上次写作此主题：质量分 {v.get('quality_score', '?')}/100，"
-        f"审校 {v.get('revision_count', '?')} 次，"
-        f"通过 {'是' if v.get('passed') else '否'}。"
-        f"请参考上次的经验把这篇写得更好。"
+    return f"上次写作此主题：{_fmt_topic_record(item.value)}。请参考上次的经验把这篇写得更好。"
+
+
+def save_topic_result(store: BaseStore | None, state: dict) -> None:
+    """终局写回长期记忆:抽取 state 的质量信号, 以 topic 为 key 写入 TOPICS_NS.
+
+    字段抽取与写入集中于此(graph.remember 只调本函数), upsert 幂等覆盖同 topic 旧记录;
+    store 为 None 或 topic 为空时跳过(无记忆模式 / 异常态). 记录以 key 为唯一题目来源,
+    value 不重复存 topic.
+    """
+    if store is None:
+        return
+    topic = state.get("topic", "")
+    if not topic:
+        return
+    store.put(
+        TOPICS_NS,
+        topic,
+        {
+            "quality_score": state.get("quality_score"),
+            "passed": bool(state.get("passed")),
+            "revision_count": state.get("revision_count", 0),
+            "draft_tail": (state.get("final_article") or "")[:200],
+        },
     )
+    logger.info(f"  🧠 已写入长期记忆: 《{topic}》质量分 {state.get('quality_score')}/100")
 
 
 def dump_memory(store: BaseStore | None) -> str:
@@ -118,22 +190,21 @@ def dump_memory(store: BaseStore | None) -> str:
     if store is None:
         return "（未启用长期记忆：build_graph 未传入 store）"
     lines = ["🧠 长期记忆（LangGraph SqliteStore 内容）", "=" * 30]
-    prefs = store.get(PREFS_NS, _PREFS_KEY)
-    if prefs is not None:
+    prefs = load_prefs(store)
+    if prefs:
         lines.append("【用户偏好】")
-        lines.append("；".join(f"{k}：{v}" for k, v in prefs.value.items()))
+        lines.append(prefs)
     else:
         lines.append("【用户偏好】未设置（可用 --prefs \"风格:轻松口语\" 写入）")
     items = store.search(TOPICS_NS, limit=20)
     lines.append("")
     lines.append(f"【历史写作记录】共 {len(items)} 条")
     for it in items:
-        v = it.value
-        lines.append(
-            f"- 《{v.get('topic', it.key)}》：质量分 {v.get('quality_score', '?')}/100，"
-            f"审校 {v.get('revision_count', '?')} 次，"
-            f"通过 {'是' if v.get('passed') else '否'}"
-        )
+        line = f"- 《{it.key}》：{_fmt_topic_record(it.value)}"
+        tail = (it.value.get("draft_tail") or "").strip()  # 文末片段, 展示成品开头, 供人工快速回看
+        if tail:
+            line += f"\n    文末：{tail}"
+        lines.append(line)
     return "\n".join(lines)
 
 

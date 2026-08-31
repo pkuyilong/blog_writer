@@ -9,7 +9,7 @@ from agents.outliner import build_outliner
 from agents.review import build_review_agent
 from agents.writing import build_writing_agent
 from langsmith_config import setup_langsmith
-from memory_store import TOPICS_NS
+from memory_store import save_topic_result
 from state import ArticleState
 
 logger = logging.getLogger(__name__)
@@ -20,36 +20,21 @@ MAX_REVISIONS = 2
 
 def should_continue(state: ArticleState) -> str:
     """条件边:审校通过或达到次数上限 → remember(写回长期记忆后结束);否则打回写作重写."""
-    if state["passed"] or state.get("revision_count", 0) >= MAX_REVISIONS:
-        if not state["passed"]:
-            logger.warning(f"  ⚠ 已达最大重写次数（{MAX_REVISIONS}），接受当前结果")
+    if state["passed"]:
+        return "remember"
+    if state.get("revision_count", 0) >= MAX_REVISIONS:
+        logger.warning(f"  ⚠ 已达最大重写次数（{MAX_REVISIONS}），接受当前结果")
         return "remember"
     return "rewrite"
 
 
 def remember(state: ArticleState, config, *, store: BaseStore | None) -> dict:
-    """终局写回长期记忆:把本题目成稿的质量信号写入 store(见 memory_store.py).
+    """终局写回长期记忆:质量信号写入 store(见 memory_store.save_topic_result).
 
-    只写终局(should_continue 判定通过/达上限后才进入), upsert 幂等覆盖同 topic 旧记录.
-    不写回任何 state 键; store 为 None(未启用记忆)时跳过.
+    只写终局(should_continue 判定通过/达上限后才进入); store 为 None(未启用记忆)时跳过.
+    不写回任何 state 键.
     """
-    if store is None:
-        return {}
-    topic = state.get("topic", "")
-    if not topic:
-        return {}
-    store.put(
-        TOPICS_NS,
-        topic,
-        {
-            "topic": topic,
-            "quality_score": state.get("quality_score"),
-            "passed": bool(state.get("passed")),
-            "revision_count": state.get("revision_count", 0),
-            "draft_tail": (state.get("final_article") or "")[:200],
-        },
-    )
-    logger.info(f"  🧠 已写入长期记忆: 《{topic}》质量分 {state.get('quality_score')}/100")
+    save_topic_result(store, state)
     return {}
 
 
