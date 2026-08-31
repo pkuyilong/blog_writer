@@ -39,6 +39,14 @@ python main.py "题目" --model deepseek-v4-flash
 # 清空搜索素材缓存（.cache/，除 TTL 7 天自动过期外的强制清空；清空后退出）
 python main.py --clear-search-cache
 
+# 长期记忆（SqliteStore 持久化到 .store/，跨任务复用）：
+# 写入用户偏好（格式 "键:值,键:值"，覆盖已有偏好并用于本次运行）
+python main.py "题目" --prefs "风格:轻松口语,篇幅:3000字"
+# 运行结束后打印已存记忆（偏好 + 历史写作记录）
+python main.py "题目" --show-memory
+# 清空长期记忆库（.store/，对称 --clear-search-cache；清空后退出）
+python main.py --clear-memory
+
 # Web 页面版：浏览器里填题目/选模型/人工确认，页面展示大纲确认与成品（必须单 worker）
 .venv/bin/python -m uvicorn web_server:app --port 8000
 # 打开 http://localhost:8000
@@ -50,13 +58,14 @@ python main.py --clear-search-cache
 ## 架构与数据流
 
 ```
-主图（graph.py）：START → outline(子图) → [human_review?] → writing(写作子Agent子图) → edit
+主图（graph.py）：START → outline(子图) → [human_review?] → writing(写作子Agent子图) → edit → remember → END
                                                                     ↑                  │
                                                     rewrite（只重写问题章节）←（should_continue）┘
   · human_review（可选，--human-review 开关经条件边启用）：大纲后 interrupt() 暂停，把大纲交给 main.py 交互循环；
     回车确认 / 意见重写 / #粘贴后 Command(resume=...) 续跑；有意见（outline_review_feedback）经 route_review 条件边回环
     重写再二次确认；默认关闭完全不执行
   · edit（审核子智能体，agents/review.py）：3 个审校角色（语言/逻辑/事实）并行独立打分，多数表决（显式通过票 ≥2/3）；passed 为假且 revision_count < MAX_REVISIONS(2) → 打回 writing（只重写 failed_sections）
+  · remember（长期记忆写回，graph.py）：审校通过或达重写上限后，把质量信号（topic/quality_score/passed/revision_count/draft_tail）写入 SqliteStore（见决策 #20）；store 为 None 时节点空转
 ```
 
 writing 子图（agents/writing.py，自包含，挂 writing 节点）：
@@ -86,7 +95,7 @@ outline 子图（agents/outliner.py，自包含）：
 | 文件 | 职责 |
 |---|---|
 | `main.py` | CLI 入口：解析参数/装配 checkpointer（SqliteSaver 或 --in-memory 的 MemorySaver）/统一交互循环（处理 `__interrupt__` 与 `Command(resume=...)`）/`--resume` 断点续跑/打印成品 |
-| `graph.py` | 主图编排：`outline → writing → edit`，`should_continue` 决定打回 `writing`（只重写问题章节） |
+| `graph.py` | 主图编排：`outline → writing → edit → remember`，`should_continue` 决定打回 `writing`（只重写问题章节）或进 `remember` 写回长期记忆（见决策 #20） |
 | `state.py` | `ArticleState`（TypedDict）：主图共享状态，**不含 materials**（素材只在子图内部流动）；`section_drafts` 用 `Annotated[dict, reducer]` 聚合并行章节草稿 |
 | `llm.py` | LLM 调用统一封装（消息形状 + `@traceable`）：`call_llm()`（一次性问答，**默认 JSON 模式**，仅 Markdown 输出显式关）/ `chat()`（返回完整响应以便读 `tool_calls`）；新增 keyword-only 的 `model`/`role` 参数，委托 model_router 选模型与兜底 |
 | `model_router.py` | **多模型路由**：`ModelSpec` 注册表（MODEL_REGISTRY）+ `ROLE_MODEL_MAP`（role→候选模型链，`__default__` 哨兵跟随全局默认）+ `resolve_chain()`（显式 model > role 链 > 全局默认，能力过滤）+ `call_with_fallback()`（失败按原因分类退避重试、耗尽切下一个模型）+ `get_client()`（按 provider 懒加载缓存）；`ModelRoutingError` |
@@ -94,6 +103,7 @@ outline 子图（agents/outliner.py，自包含）：
 | `prompts.py` | 各 Agent 中文 system prompt：RESEARCHER / MATERIAL_REVIEW / OUTLINER / FALLBACK_OUTLINE / REVISE_OUTLINE / SPLIT / WRITE_SECTION / REVIEW_LANG / REVIEW_LOGIC / REVIEW_FACT（含共享 `_REVIEW_JSON_SCHEMA`，已嵌入 `model_json_schema()` 导出的真实 JSON Schema） |
 | `agents/tools.py` | `web_search()`（成功返回 JSON 数组 [{title,link,body}]，失败/无结果返回 {"error"} 但保留关键词；失败按原因分类、退避重试同一 query）+ `WEB_SEARCH_TOOL`（OpenAI 兼容 function schema） |
 | `search_cache.py` | **两级搜索缓存**：`search_cache` 表（query→web_search 原始结果）+ `topic_materials` 表（topic→审查后素材），SQLite 跨进程复用；`cached_search`（query 级，单飞防并发重复搜索）/ `get_cached_materials`+`store_materials`（topic 级）/ `clear()`（供 `--clear-search-cache`）；TTL 惰性失效 |
+| `memory_store.py` | **长期记忆（LangGraph 官方 SqliteStore）**：`open_store()`（自建连接 + `PRAGMA journal_mode=WAL` 的 context manager）/ `parse_prefs_arg`+`save_prefs`+`load_prefs`（用户偏好，namespace `("prefs",)` key="default"）/ `load_topic_history`（历史写作记录，namespace `("topics",)` key=topic）/ `dump_memory`（`--show-memory`）/ `clear`（`--clear-memory`）；持久化到 `.store/memory.db`，跨线程/跨运行复用（见决策 #20） |
 | `agents/outliner.py` | **大纲子智能体**：自包含子图（搜索→审查→生成→自检→补搜/重试/兜底）；搜索多查询 ThreadPool 并行 |
 | `agents/writing.py` | **写作子 Agent**（自包含子图，挂 `writing` 节点）：内部 `split_sections`（拆章，经 `SplitOutput` 强校验、失败反馈重试，打回复用）/ `fan_out_write`（条件边，返回 `[Send]` 或 "merge"）/ `merge_sections`（按 id 升序拼装）；`output_schema` 只写回 `draft`/`sections`/`section_drafts`；**不含写作 LLM** |
 | `agents/section_writer.py` | **章节写作子智能体**（自包含子图，挂 `write_section` 节点）：`write`（初稿/重写）→ `self_check`（启发式自检：篇幅/标题/要点）→ `should_rewrite`（条件重写，`MAX_SECTION_ATTEMPTS` 上限）→ `emit`（输出 `section_drafts`）；`output_schema` 限定子图只输出该键 |
@@ -203,6 +213,15 @@ outline 子图（agents/outliner.py，自包含）：
     - **`_run_search` 防御性强校验**：内部再 `model_validate_json`，非法返回 `{"error": "工具参数校验失败: ..."}` 文本（正常路径由 search 节点提前校验兜底，这里是双保险），不再 `json.loads().get()`。
     - 测试 mock 点：`tests/test_outliner_subagent.py` 的 fake_chat 新增配置 `tool_calls_seq`（逐批弹出 `[(id, args_dict|raw_str)]`，`make_tc_raw` 构造非法参数）驱动重试；默认不设该键则行为与旧版一致（现有 A~H 场景计数不变）。
 
+20. **长期记忆（memory_store.py）——LangGraph 官方 SqliteStore 跨任务持久化**：项目已有两层"记忆"（search_cache 事实素材缓存、SqliteSaver 执行状态断点续跑），本决策补第三层 **agent 行为层记忆**——用户写作偏好 + 历史写作记录，跨线程/跨运行复用。要点：
+    - **namespace 设计**：`("prefs",)` 存用户偏好（key 固定 `"default"`，`save_prefs`/`load_prefs`）；`("topics",)` 存历史写作记录（key=topic，`load_topic_history`）。节点经 `(state, config, *, store)` 签名访问，store 由父图 `compile(store=...)` 经 config/runtime 一路下传——**任意深度嵌套子图节点都能拿到**（section_writer/outliner 都嵌在主图内，实测可用）。
+    - **连接必须自己造 [坑]**：`SqliteStore.from_conn_string()` 返回 context manager，拿不到底层连接、无法设 `PRAGMA journal_mode=WAL`；且其 per-put `ttl` 单位是**分钟**。本模块 `memory_store.open_store()` 自建 `sqlite3.connect(..., isolation_level=None)` + `PRAGMA journal_mode=WAL`——`isolation_level=None`（autocommit）是 SqliteStore 内部自管事务的硬要求，否则 BEGIN 报 `cannot start a transaction within a transaction`；WAL 缓解 CLI 与 web 并发写同一库的 `database is locked`（**web 与 CLI 勿同时跑**）。
+    - **TTL 陷阱 [坑]**：SqliteStore 的 per-put `ttl` **实际不生效**——`get`/`search` 不过滤过期行，TTL sweeper 需 store 级 `ttl_config` 才启动。本项目**不用 TTL**，记忆长期保留；真要"记忆过期"语义，再引入 store 级 ttl config + `start_ttl_sweeper`。
+    - **节点注解约束 [坑]**：store 参数注解必须是**真实类型** `store: BaseStore | None`，目标模块**不能有 `from __future__ import annotations`**——langgraph 注入靠运行时 `annotation == Optional[BaseStore]` 相等判断，future import 的字符串注解匹配不上、注入失败、节点缺参直接 TypeError。
+    - **与 checkpointer 正交**：checkpoint 是 **thread 级执行状态**（`--in-memory` 只影响它）；store 是**跨线程/跨运行的全局记忆**，恒用 SqliteStore 持久化到 `.store/memory.db`。`main.py` 每次 `with memory_store.open_store()` 打开库 → `--prefs` 先写入 → `build_graph(..., store=store)` 注入。
+    - **Web 装配 [坑]**：`web_server._get_store()` 懒加载全局单例，必须把 `open_store()` 的 **context manager 留在模块级**（`_store_cm`）——若只 `open_store(path).__enter__()` 拿 store 就把 context manager 丢给 GC，生成器 `finally: conn.close()` 立即执行，SqliteStore 拿到**已关闭连接**，任何 store 读都抛 `Cannot operate on a closed database`（web 测试 14/33 全崩实测）；`_reset_for_tests()` 里 `__exit__(None, None, None)` 释放。
+    - **偏好/历史注入点**：`section_writer.write`（if/else 分支之后、feedback 之前，**首写与重写两分支都生效**）+ `outliner.generate`（偏好 + 该题历史写作记录）；`remember` 终局写回（`should_continue` 判定通过/达上限后进入，`store.put(TOPICS_NS, topic, {...})` 幂等覆盖同 topic 旧记录）。
+
 ## 测试方法
 
 - **确定性控制流测试**：在模块层替换 `O.chat` / `O.cached_search`（fake），断言调用次数与返回键。这样不耗 token 就能覆盖所有分支（收敛/补搜/兜底/重试/私有键不泄漏）。注意 v2.3 起还需 mock `O.get_cached_materials`/`O.store_materials`（防连真库，见决策 #15）。
@@ -215,6 +234,7 @@ outline 子图（agents/outliner.py，自包含）：
 - 多模型路由：`tests/test_model_router.py`（60 项检查）——mock `llm.get_client`（fake client）与 `llm.call_with_fallback`（spy），覆盖 role 路由解析 / `__default__` 哨兵→全局默认 / `set_default_model` 覆盖 / 能力过滤（role 链跳过 vs 显式 model 报错）/ fallback 成功与耗尽（保留 `__cause__`）/ 审校 3 个角色 role 正确传递（跑 `build_review_agent().invoke` 断言最近 3 次调用是 edit_lang/edit_logic/edit_fact）/ 旧无参行为不变 / client 懒加载缓存与缺 env 报错 / **失败分类退避重试**（限流同模型重试成功、`retry-after` 头优先、超时重试成功、瞬时耗尽切下一个模型、认证等致命错误不重试、`_classify_llm_error`/`_retry_delay` 单测） / **按失败信息编辑参数**（`context_length_exceeded` 缩小 `adjust["max_tokens"]` 立即重试同一模型、缩到 `MIN_MAX_TOKENS` 仍超才切下一个、其他 400 走 fatal 切模型；用 `httpx.Request/Response` 构造真实 openai 异常、`patch("model_router.time")` 隔离 sleep）。
 - 搜索缓存：`tests/test_search_cache.py`（18 项检查）——mock `search_cache.web_search`（临时库隔离，覆盖 `DB_PATH`），覆盖 query 级 miss/命中 / key 规范化（首尾空白、大小写）/ TTL 过期重新搜索 / topic 级 store→hit→过期 miss / `clear()` 清空并返回条数 / **并发单飞（8 线程同 query，真实搜索次数 == 1）** / 空 key 不缓存。
 - Web 页面版：`tests/test_web_server.py`（33 项检查）——mock 全部 LLM（`O.chat`/`O.cached_search`/`W.call_llm`/`SW.call_llm`/`R.call_llm`/`HR.call_llm`，mock 套件与 test_section_writer 同一套），TestClient（httpx）驱动后台 worker 线程，覆盖 run→waiting→resume(confirm/revise/replace)→done 状态机（revise 用**谓词等待**防"拿到旧 waiting"竞态、replace 用 `run_until` 的**状态序列**守护"不二次 waiting"）、409/400 校验、cancel（waiting→202、**running→409**）、异常兜底、**run 端点 build_graph 失败→500 清槽回 idle**。**每个用例开头必须 `web_server._reset_for_tests()`**（单槽注册表是进程级全局，cancel→join 线程→清槽→恢复默认模型，否则拿到上个任务状态）。
+- 长期记忆：`tests/test_memory_store.py`（21 项检查）——mock 全套 LLM + 临时 SqliteStore，覆盖 store=None 行为不变（SW 首写无「【写作偏好】」）/ 偏好注入（save_prefs 后 SW 首写与 O.chat OUTLINER 消息都含偏好段）/ remember 写回（`store.get(("topics",), topic)` 读回质量信号，二次 invoke 带「【历史写作记录】」）/ `parse_prefs_arg`（中英文冒号逗号混用、空段跳过）/ `save_prefs` 覆盖 / `open_store` 临时库两次打开持久化 / `load_topic_history` 有记录/无记录。**store 隔离**：`test_web_server.py` 模块级把 `web_server._store_path` 指向临时库（`tempfile.mkdtemp()`），脚本末 `shutil.rmtree` 清理，防连真 `.store/memory.db`。
 - **真实 e2e**：跑 `python main.py "题目" --output out.md`，检查日志出现补搜/重试提示、成品是合法 Markdown、质量分正常。注意真实搜索 + LLM 调用可能超过 5 分钟，超时后转后台即可。
 
 ## 安全注意事项

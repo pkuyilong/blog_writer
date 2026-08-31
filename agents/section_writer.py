@@ -24,8 +24,10 @@ import logging
 from typing import Annotated, TypedDict
 
 from langgraph.graph import START, END, StateGraph
+from langgraph.store.base import BaseStore
 
 from llm import call_llm
+from memory_store import load_prefs
 from prompts import SELF_REVIEW_PROMPT, WRITE_SECTION_PROMPT
 from state import _merge_dicts
 
@@ -84,11 +86,15 @@ def _self_check(section: dict, draft: str) -> tuple[bool, str]:
     return (not problems), "；".join(problems)
 
 
-def write(state: SectionWriterState) -> dict:
+def write(state: SectionWriterState, config, *, store: BaseStore | None) -> dict:
     """初稿或按自检/审校意见重写;write_attempt 自增.
 
     首写用 WRITE_SECTION_PROMPT(基于要点与素材生成);重写用 SELF_REVIEW_PROMPT,
     把上一版草稿 + 自检意见 + 审校意见一并给模型,让它审视后直接输出改进版.
+
+    store 参数由 langgraph 注入(父图 compile(store=...) 传入, 见 memory_store.py):
+    有用户偏好时拼进 user_content(首写与重写两分支都生效), store 为 None 跳过.
+    注意注解必须是真实类型 `BaseStore | None`(future import 字符串会注入失败).
     """
     attempt = state.get("write_attempt", 0) + 1
     sec = state["section"]
@@ -113,6 +119,11 @@ def write(state: SectionWriterState) -> dict:
         if state.get("self_check_notes"):
             user_content += f"\n\n【自检意见】{state['self_check_notes']}"
         prompt = SELF_REVIEW_PROMPT
+
+    # 长期记忆:用户偏好注入(来自 memory_store, 跨任务持久化), 覆盖首写与重写两个分支
+    prefs = load_prefs(store)
+    if prefs:
+        user_content += f"\n\n【写作偏好（来自长期记忆）】{prefs}"
 
     if state.get("feedback"):
         user_content += f"\n\n【上轮审校意见】{state['feedback']}\n请逐条针对意见修改本章节。"

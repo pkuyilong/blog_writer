@@ -35,6 +35,7 @@
 - 📝 输出**标准 Markdown**：一级标题 + `##` 小节，可直接渲染
 - 🧭 **多模型路由**：所有 LLM 调用按角色路由（research/outline/split/write/edit_lang/edit_logic/edit_fact/revise_outline），调用失败自动 fallback 切备用模型；`--model` 可全局换模型（目前注册 DeepSeek，加第二个模型只需在 `MODEL_REGISTRY` 注册一个规格）
 - 📦 **搜索素材缓存（知识复用）**：搜索原始结果与整题审查后素材按 7 天 TTL 存进 SQLite（`.cache/`），同一题目/相似关键词跨运行复用，跳过重复联网与重复审查；`--clear-search-cache` 可手动清空
+- 🧠 **长期记忆**：记住你的写作偏好与历史写作记录（LangGraph 官方 SqliteStore 持久化到 `.store/`），下次写作自动注入偏好、参考上次经验；`--prefs` 写入偏好 / `--show-memory` 查看记忆 / `--clear-memory` 清空
 - 📊 可选接入 **LangSmith** 追踪每次 Agent 执行与 LLM 调用（`llm.py` 用 `@traceable` 上报）
 - 💻 纯命令行使用，零界面依赖
 - 🌐 **Web 页面版**：FastAPI 起本地服务，浏览器里填题目 / 选模型 / 开关人工确认，大纲确认与成品展示都在页面完成（复用 CLI 同一套 interrupt/resume 协议，图逻辑零改动）
@@ -62,6 +63,7 @@ blog_writer/
 ├── llm.py                  # LLM 调用统一封装 call_llm() / chat()（消息形状 + @traceable，委托 model_router 选模型）
 ├── model_router.py         # 多模型路由：ModelSpec 注册表 + role→模型链 + fallback + client 缓存
 ├── search_cache.py         # 两级搜索缓存：query→搜索结果 + topic→审查后素材，SQLite 跨进程复用
+├── memory_store.py         # 长期记忆：用户偏好 + 历史写作记录（LangGraph SqliteStore，持久化到 .store/）
 ├── prompts.py              # 各 Agent 的中文 system prompt（含 MATERIAL_REVIEW_PROMPT 素材审查）
 ├── logging_config.py       # 统一日志：stderr 简洁 + 文件详细，--verbose 控制级别
 ├── langsmith_config.py     # LangSmith 配置：校验环境变量、读取 .env
@@ -167,6 +169,14 @@ python main.py "为什么越来越多的人选择远程办公" --model deepseek-
 python main.py --clear-search-cache
 ```
 
+可选：长期记忆（SqliteStore 持久化到 `.store/`，跨任务复用）——先写入写作偏好，后续运行同一题目时会自动注入偏好与历史写作记录：
+
+```bash
+python main.py "为什么越来越多的人选择远程办公" --prefs "风格:轻松口语,篇幅:3000字"   # 写入用户偏好并用于本次运行
+python main.py "为什么越来越多的人选择远程办公" --show-memory   # 运行结束后打印已存记忆（偏好 + 历史写作记录）
+python main.py --clear-memory                                    # 清空长期记忆库后退出
+```
+
 ## Web 页面版
 
 不想用命令行？可以起一个本地 Web 服务，在浏览器里完成"填题目 → 选模型 →（可选）人工确认大纲 → 看成品"全流程：
@@ -233,6 +243,7 @@ python main.py --clear-search-cache
    graph.add_node("human_review", human_review_node)       # 可选：人工确认/修改大纲
    graph.add_node("writing", build_writing_agent())        # 写作子 Agent（自包含子图：拆章+并行写章+合并）
    graph.add_node("edit", build_review_agent())            # 审核子智能体（3 角色并行打分 + 多数表决）
+   graph.add_node("remember", remember)                    # 长期记忆写回（终局）
    graph.add_edge(START, "outline")
    graph.add_conditional_edges("outline", route_outline,    # --human-review 开关路由
                                {"human_review": "human_review", "writing": "writing"})
@@ -240,10 +251,11 @@ python main.py --clear-search-cache
                                {"human_review": "human_review", "writing": "writing"})
    graph.add_edge("writing", "edit")
    graph.add_conditional_edges("edit", should_continue,
-                               {"rewrite": "writing", "end": END})
+                               {"rewrite": "writing", "remember": "remember"})
+   graph.add_edge("remember", END)
    ```
 
-   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就结束，否则打回 `writing`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（`interrupt()` 暂停展示大纲）再到 `writing`；用户输入修改意见时经条件边 `route_review` 回 `human_review` 先重写大纲、再二次确认；默认关闭直接到 `writing`，该节点完全不执行。
+   `should_continue` 读到 `passed` 为真或 `revision_count` 达到上限（`MAX_REVISIONS = 2`）就进入 `remember`（把本题目成稿信号写入长期记忆）再结束，否则打回 `writing`（**只重写 `failed_sections` 里的问题章节**）。`--human-review` 开启时，`outline` 后经条件边 `route_outline` 先进入 `human_review` 节点（`interrupt()` 暂停展示大纲）再到 `writing`；用户输入修改意见时经条件边 `route_review` 回 `human_review` 先重写大纲、再二次确认；默认关闭直接到 `writing`，该节点完全不执行。
 
 3. **大纲子智能体（`agents/outliner.py`）**：一个编译好的**自包含子图**，挂到主图的 `outline` 节点，负责"检索 + 生成提纲"一体：
    - **搜索**：把对话交给模型（带 `web_search` 工具），模型一次提出 3-5 个具体查询，用 `ThreadPoolExecutor` **并发**执行搜索（上限 4）；模型生成的搜索参数会先经 schema 强校验——非法参数不会崩溃或静默丢弃，而是把**具体字段错误**（字段 + 期望 + 实际值）反馈给模型重新生成（最多 2 次），仍非法则跳过该条、只执行合法查询；

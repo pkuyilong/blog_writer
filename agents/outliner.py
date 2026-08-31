@@ -20,9 +20,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
 from langgraph.graph import START, END, StateGraph
+from langgraph.store.base import BaseStore
 from pydantic import ValidationError
 
 from llm import chat
+from memory_store import load_prefs, load_topic_history
 from prompts import (
     FALLBACK_OUTLINE_PROMPT,
     OUTLINER_PROMPT,
@@ -261,8 +263,12 @@ def should_search_again(state: OutlineState) -> str:
     return "search"
 
 
-def generate(state: OutlineState) -> dict:
-    """基于素材生成/重试提纲;outline_attempt 自增,重试时提示模型补全."""
+def generate(state: OutlineState, config, *, store: BaseStore | None) -> dict:
+    """基于素材生成/重试提纲;outline_attempt 自增,重试时提示模型补全.
+
+    store 参数由 langgraph 注入(父图 compile(store=...) 传入, 见 memory_store.py):
+    注入用户偏好 + 该题目的历史写作记录(长期记忆, 跨任务复用), store 为 None 跳过.
+    """
     attempt = state.get("outline_attempt", 0) + 1
     logger.info(f"  📋 大纲子智能体生成提纲（第 {attempt} 次）…")
     user_content = (
@@ -270,6 +276,12 @@ def generate(state: OutlineState) -> dict:
     )
     if attempt > 1:
         user_content += "\n\n（上一版提纲不够完整/可用，请基于素材输出一份更完整、可直接支撑写作的提纲。）"
+    prefs = load_prefs(store)
+    if prefs:
+        user_content += f"\n\n【写作偏好（来自长期记忆）】{prefs}"
+    history = load_topic_history(store, state["topic"])
+    if history:
+        user_content += f"\n\n【历史写作记录】{history}"
     resp = chat(OUTLINER_PROMPT, [{"role": "user", "content": user_content}], tools=[], role="outline")
     outline = resp.choices[0].message.content or ""
     return {"outline": outline, "outline_attempt": attempt}

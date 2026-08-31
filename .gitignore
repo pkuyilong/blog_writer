@@ -165,6 +165,8 @@ activemq-data/
 .venv
 # LangGraph SqliteSaver 持久化目录（checkpoint 本地库，不提交）
 .checkpoints/
+# LangGraph 长期记忆库（SqliteStore，偏好 + 历史写作记录，不提交）
+.store/
 env/
 venv/
 ENV/

@@ -34,6 +34,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 from pydantic import BaseModel
 
+import memory_store
 from graph import build_graph
 from model_router import MODEL_REGISTRY, ModelRoutingError, get_default_model, set_default_model
 
@@ -51,6 +52,26 @@ _task_lock = threading.Lock()  # 保护 TaskState 与注册表的全部读写
 _cond = threading.Condition(_task_lock)  # interrupt 挂起 / resume 唤醒
 _current_task: "TaskState | None" = None
 _current_thread: threading.Thread | None = None  # 供测试 join 用
+
+# 长期记忆 store 全局单例(单进程单 worker, 与 MemorySaver 正交: MemorySaver 是每任务
+# 一个的 thread 级执行状态, store 是全局跨任务记忆). 懒加载;测试用 _reset_for_tests()
+# 关闭重置, 或先设 _store_path 指向临时库隔离(避免连真 .store/memory.db).
+_store: "BaseStore | None" = None
+# 保持 open_store 的 context manager 存活: 若只 `open_store(path).__enter__()` 拿到
+# store 就把 context manager 丢给 GC, 生成器的 finally: conn.close() 会立即执行,
+# SqliteStore 拿到的连接被关, 后续 store.get() 抛 "Cannot operate on a closed database"
+# (实测踩坑, 见 CLAUDE.md 决策 #20). 所以必须把 context manager 留在模块级, 退出时再 __exit__.
+_store_cm = None
+_store_path = memory_store.DB_PATH
+
+
+def _get_store():
+    """懒加载全局 SqliteStore(连接 + WAL, 见 memory_store.open_store)."""
+    global _store, _store_cm
+    if _store is None:
+        _store_cm = memory_store.open_store(_store_path)
+        _store = _store_cm.__enter__()
+    return _store
 
 
 @dataclass
@@ -161,7 +182,11 @@ def run(req: RunRequest) -> dict:
     # 构建失败(如缺 API key)会抛异常,必须清槽回 idle,否则槽位被卡死的 running 任务占用
     try:
         checkpointer = MemorySaver()
-        graph = build_graph(enable_human_review=req.human_review, checkpointer=checkpointer)
+        graph = build_graph(
+            enable_human_review=req.human_review,
+            checkpointer=checkpointer,
+            store=_get_store(),
+        )
         config = {"configurable": {"thread_id": task.id}}
         # 与 main.py:99-105 的 initial_input 完全一致
         initial_input = {
@@ -259,7 +284,7 @@ def _reset_for_tests() -> None:
 
     单槽注册表是进程级全局,必须在用例间复位,否则后续用例拿到上一个任务的状态.
     """
-    global _current_task, _current_thread
+    global _current_task, _current_thread, _store, _store_cm
     with _task_lock:
         task = _current_task
         thread = _current_thread
@@ -275,3 +300,12 @@ def _reset_for_tests() -> None:
     with _task_lock:
         _current_task = None
         _current_thread = None
+        if _store_cm is not None:
+            _store_cm.__exit__(None, None, None)  # 触发 open_store 的 finally: conn.close()
+            _store_cm = None
+        if _store is not None:
+            try:
+                _store.conn.close()  # SqliteStore 暴露 conn;双保险关连接释放 fd
+            except Exception:
+                pass
+            _store = None

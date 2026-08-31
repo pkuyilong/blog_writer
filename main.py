@@ -6,6 +6,7 @@ import uuid
 
 from langgraph.types import Command
 
+import memory_store
 from graph import build_graph
 from logging_config import setup_logging
 
@@ -71,56 +72,83 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="清空搜索素材缓存（.cache/）后退出，不继续生成文章",
     )
+    parser.add_argument(
+        "--prefs",
+        default=None,
+        metavar='"键:值,键:值"',
+        help="把用户偏好写入长期记忆（如 风格:轻松口语,篇幅:3000字），覆盖已有偏好并用于本次运行",
+    )
+    parser.add_argument(
+        "--show-memory",
+        action="store_true",
+        help="运行结束后打印长期记忆内容（教学演示 SqliteStore 持久化）",
+    )
+    parser.add_argument(
+        "--clear-memory",
+        action="store_true",
+        help="清空长期记忆库（.store/）后退出，不继续生成文章",
+    )
     return parser.parse_args()
 
 
 def _run(args, checkpointer) -> int:
-    """装配 checkpointer 后运行完整流程:构建图 →(可选 --resume)→ 交互 invoke → 打印成品.
+    """装配 checkpointer + store 后运行完整流程:构建图 →(可选 --resume)→ 交互 invoke → 打印成品.
 
     checkpointer 由 main() 提供(MemorySaver 实例,或 `with SqliteSaver.from_conn_string(...)`
     解包出的实例);interrupt() 人工介入与 --resume 断点续跑都依赖它(compile(checkpointer=...)).
+    长期记忆(store)独立于 checkpointer:--in-memory 只影响执行状态, store 恒用 SqliteStore
+    持久化到 .store/(见 memory_store.py), 二者正交.
     """
-    graph = build_graph(enable_human_review=args.human_review, checkpointer=checkpointer)
-
-    thread_id = args.resume or uuid.uuid4().hex
-    config = {"configurable": {"thread_id": thread_id}}
-
-    if args.resume:
-        logger.info(f"↩ 从断点恢复：thread_id={thread_id}")
-        snap = graph.get_state(config)
-        logger.info(f"  快照：待执行 next={snap.next}，已存键={sorted((snap.values or {}).keys())}")
-        # 停在 interrupt 处时 invoke(None) 会重新触发该 interrupt,进入下方交互循环
-        initial_input = None
-    else:
-        logger.info(
-            f"题目：《{args.topic}》（thread_id={thread_id}；"
-            f"中途退出可用 --resume {thread_id} 断点续跑）\n"
+    with memory_store.open_store() as store:
+        if args.prefs:
+            memory_store.save_prefs(store, memory_store.parse_prefs_arg(args.prefs))
+        graph = build_graph(
+            enable_human_review=args.human_review, checkpointer=checkpointer, store=store
         )
-        initial_input = {
-            "topic": args.topic,
-            "sections": [],
-            "section_drafts": {},
-            "failed_sections": [],
-            "revision_count": 0,
-        }
 
-    result = _interactive_invoke(graph, config, initial_input, thread_id)
+        thread_id = args.resume or uuid.uuid4().hex
+        config = {"configurable": {"thread_id": thread_id}}
 
-    article = result["final_article"]
-    # 成品文章是 stdout 产物(供直接查看 / 重定向保存),不走 logging;
-    # 进度/告警日志已由 logging 输出到 stderr 与日志文件,不会混入产物.
-    print("\n" + "=" * 50)
-    print(f"成品文章（质量分 {result.get('quality_score', 'N/A')}/100，"
-          f"审校 {result.get('revision_count', 'N/A')} 次）：")
-    print("=" * 50)
-    print(article)
+        if args.resume:
+            logger.info(f"↩ 从断点恢复：thread_id={thread_id}")
+            snap = graph.get_state(config)
+            logger.info(f"  快照：待执行 next={snap.next}，已存键={sorted((snap.values or {}).keys())}")
+            # 停在 interrupt 处时 invoke(None) 会重新触发该 interrupt,进入下方交互循环
+            initial_input = None
+        else:
+            logger.info(
+                f"题目：《{args.topic}》（thread_id={thread_id}；"
+                f"中途退出可用 --resume {thread_id} 断点续跑）\n"
+            )
+            initial_input = {
+                "topic": args.topic,
+                "sections": [],
+                "section_drafts": {},
+                "failed_sections": [],
+                "revision_count": 0,
+            }
 
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(article)
-        logger.info(f"已保存到：{args.output}")
+        result = _interactive_invoke(graph, config, initial_input, thread_id)
 
-    return 0
+        article = result["final_article"]
+        # 成品文章是 stdout 产物(供直接查看 / 重定向保存),不走 logging;
+        # 进度/告警日志已由 logging 输出到 stderr 与日志文件,不会混入产物.
+        print("\n" + "=" * 50)
+        print(f"成品文章（质量分 {result.get('quality_score', 'N/A')}/100，"
+              f"审校 {result.get('revision_count', 'N/A')} 次）：")
+        print("=" * 50)
+        print(article)
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(article)
+            logger.info(f"已保存到：{args.output}")
+
+        if args.show_memory:
+            print("\n" + memory_store.dump_memory(store))
+            print(f"（本次运行 thread_id={thread_id}）")
+
+        return 0
 
 
 def _print_outline(payload: dict) -> None:
@@ -186,6 +214,14 @@ def main() -> int:
 
         n1, n2 = clear()
         logger.info(f"🧹 已清空搜索素材缓存: query {n1} 条, topic {n2} 条")
+        return 0
+
+    # --clear-memory:独立维护命令, 清空 .store/ 长期记忆库后退出, 与模型/题目无关
+    if args.clear_memory:
+        from memory_store import clear as clear_memory
+
+        n = clear_memory()
+        logger.info(f"🧹 已清空长期记忆库: 删除 {n} 个文件")
         return 0
 
     # --model 覆盖全局默认模型:只查注册表,不读 env(key 在首次真实调用时懒读),

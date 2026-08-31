@@ -217,13 +217,13 @@ O.store_materials = lambda t, m: None
 try:
     O.search({"topic": "远程办公"})  # 2 次 chat:搜索意图 + 素材审查
     check("T7 outliner.search → research ×2", calls[-2:] == ["research", "research"], f"{calls[-2:]}")
-    O.generate({"topic": "T", "materials": "素材"})
+    O.generate({"topic": "T", "materials": "素材"}, None, store=None)  # config/store 由 langgraph 注入, 单测直接传 None
     check("T7 outliner.generate → outline", calls[-1] == "outline", f"{calls[-1:]}")
     O.fallback({"topic": "T"})
     check("T7 outliner.fallback → outline", calls[-1] == "outline", f"{calls[-1:]}")
     W.split_sections({"topic": "T", "outline": "提纲"})
     check("T7 writer.split_sections → split", calls[-1] == "split", f"{calls[-1:]}")
-    SW.write({"section": {"id": 1, "title": "引言", "points": [], "materials": []}, "topic": "T"})
+    SW.write({"section": {"id": 1, "title": "引言", "points": [], "materials": []}, "topic": "T"}, None, store=None)
     check("T7 section_writer.write → write", calls[-1] == "write", f"{calls[-1:]}")
     R.build_review_agent().invoke({"draft": "文章草稿"})
     check("T7 review 子图 → edit_lang/edit_logic/edit_fact 各调一次",

@@ -17,7 +17,9 @@ review.call_llm / human_review.call_llm),不耗 token.用 FastAPI TestClient(htt
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 
@@ -34,6 +36,13 @@ import web_server
 from web_server import app
 
 client = TestClient(app)
+
+# 长期记忆 store 隔离:web_server 现在强制挂全局 store(懒加载 _get_store), 会把
+# .store/memory.db 写进真实记忆库, 污染后续真实运行。这里把 _store_path 指向临时库;
+# _reset_for_tests() 每次关闭连接并置 None, _get_store() 下次按当前 _store_path 懒重建,
+# 33 项检查互不串库、不写真库。脚本末尾 rmtree 清理临时目录。
+_TMP_MEMORY = tempfile.mkdtemp(prefix="bw_web_memory_")
+web_server._store_path = os.path.join(_TMP_MEMORY, "memory.db")
 
 passed = []
 
@@ -342,6 +351,7 @@ finally:
     web_server._worker_main = orig_worker
 
 web_server._reset_for_tests()
+shutil.rmtree(_TMP_MEMORY, ignore_errors=True)  # 清临时记忆库(_reset 已关连接)
 
 print()
 failed = [p for p in passed if not p[1]]
